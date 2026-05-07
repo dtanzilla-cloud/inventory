@@ -26,8 +26,9 @@ const emptyDraft = {
   supplier: "",
   repack: "",
   note: "",
-  docs: [],
 };
+
+const DOCUMENT_BUCKET = "activity-documents";
 
 const chargeMonths = {
   "December 2025": {
@@ -70,8 +71,12 @@ function normalizeActivity(activity) {
   return {
     ...activity,
     activity_date: activity.activity_date || activity.date || "",
-    docs: Array.isArray(activity.docs) ? activity.docs : [],
+    documents: Array.isArray(activity.documents) ? activity.documents : [],
   };
+}
+
+function sanitizeFileName(fileName) {
+  return fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
 function deriveInventoryRows(activities) {
@@ -117,6 +122,7 @@ export default function InventoryManagementSystem() {
   const [draft, setDraft] = useState(emptyDraft);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
+  const [uploadingActivityId, setUploadingActivityId] = useState(null);
 
   useEffect(() => {
     loadActivities();
@@ -137,7 +143,37 @@ export default function InventoryManagementSystem() {
       setErrorMessage("Could not load activities from Supabase.");
       setActivities([]);
     } else {
-      setActivities((data || []).map(normalizeActivity));
+      const loadedActivities = (data || []).map(normalizeActivity);
+      const activityIds = loadedActivities.map((activity) => activity.id).filter(Boolean);
+
+      if (activityIds.length === 0) {
+        setActivities(loadedActivities);
+      } else {
+        const { data: documents, error: documentsError } = await supabase
+          .from("documents")
+          .select("id, activity_id, file_name, file_url")
+          .in("activity_id", activityIds)
+          .order("file_name", { ascending: true });
+
+        if (documentsError) {
+          console.error(documentsError);
+          setErrorMessage("Activities loaded, but documents could not be loaded.");
+          setActivities(loadedActivities);
+        } else {
+          const documentsByActivity = (documents || []).reduce((acc, document) => {
+            const key = String(document.activity_id);
+            acc[key] = [...(acc[key] || []), document];
+            return acc;
+          }, {});
+
+          setActivities(
+            loadedActivities.map((activity) => ({
+              ...activity,
+              documents: documentsByActivity[String(activity.id)] || [],
+            })),
+          );
+        }
+      }
     }
 
     setLoading(false);
@@ -208,11 +244,59 @@ export default function InventoryManagementSystem() {
     setActivities((current) => current.filter((activity) => activity.id !== id));
   }
 
-  function attachDoc(id, fileList) {
-    const files = Array.from(fileList || []).map((f) => f.name);
-    setActivities((current) =>
-      current.map((a) => (a.id === id ? { ...a, docs: [...a.docs, ...files] } : a)),
-    );
+  async function uploadDocuments(activityId, fileList) {
+    const files = Array.from(fileList || []);
+    if (!activityId || files.length === 0) return;
+
+    setErrorMessage("");
+    setUploadingActivityId(activityId);
+
+    try {
+      const uploadedDocuments = [];
+
+      for (const file of files) {
+        const storagePath = `${activityId}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
+
+        // Future auth policy point: Storage and documents RLS should require access to this activity.
+        const { error: uploadError } = await supabase.storage
+          .from(DOCUMENT_BUCKET)
+          .upload(storagePath, file, { upsert: false });
+
+        if (uploadError) throw uploadError;
+
+        const { data: publicUrlData } = supabase.storage
+          .from(DOCUMENT_BUCKET)
+          .getPublicUrl(storagePath);
+
+        const documentPayload = {
+          activity_id: activityId,
+          file_name: file.name,
+          file_url: publicUrlData.publicUrl,
+        };
+
+        const { data: insertedDocument, error: insertError } = await supabase
+          .from("documents")
+          .insert([documentPayload])
+          .select("id, activity_id, file_name, file_url")
+          .single();
+
+        if (insertError) throw insertError;
+        uploadedDocuments.push(insertedDocument);
+      }
+
+      setActivities((current) =>
+        current.map((activity) =>
+          activity.id === activityId
+            ? { ...activity, documents: [...activity.documents, ...uploadedDocuments] }
+            : activity,
+        ),
+      );
+    } catch (error) {
+      console.error(error);
+      setErrorMessage("Document upload failed. Please try again.");
+    } finally {
+      setUploadingActivityId(null);
+    }
   }
 
   return (
@@ -239,7 +323,7 @@ export default function InventoryManagementSystem() {
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, attachDoc, loading }} />}
+            {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} totals={totals} />}
             {section === "Charges" && <ChargesView month={month} charges={charges} />}
             {section === "Settings" && <SettingsView />}
@@ -258,7 +342,7 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, attachDoc, loading }) {
+function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading }) {
   return <>
     <Header title="Activities" subtitle="Inbound, outbound, repack, notes, and documents per event." />
     <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
@@ -284,7 +368,7 @@ function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, a
     {loading ? (
       <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">Loading activities...</div>
     ) : (
-      <Table headers={["Date", "Whse", "Pallet", "Pieces", "Product", "Customer", "Supplier", "Docs", ""]} rows={visibleActivities.map((a) => [a.activity_date, a.warehouse, a.pallets, a.pieces, a.product, a.customer || "-", a.supplier || "-", <DocUpload key={a.id} docs={a.docs} onChange={(files) => attachDoc(a.id, files)} />, <Button key="del" size="sm" variant="ghost" onClick={() => deleteActivity(a.id)}><Trash2 size={16} /></Button>])} />
+      <Table headers={["Date", "Whse", "Pallet", "Pieces", "Product", "Customer", "Supplier", "Docs", ""]} rows={visibleActivities.map((a) => [a.activity_date, a.warehouse, a.pallets, a.pieces, a.product, a.customer || "-", a.supplier || "-", <DocUpload key={a.id} documents={a.documents} uploading={uploadingActivityId === a.id} onChange={(files) => uploadDocuments(a.id, files)} />, <Button key="del" size="sm" variant="ghost" onClick={() => deleteActivity(a.id)}><Trash2 size={16} /></Button>])} />
     )}
   </>;
 }
@@ -323,16 +407,24 @@ function Rate({ label, value }) { return <div className="flex justify-between py
 function Input({ label, value, onChange, type = "text" }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><input type={type} className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={value} onChange={(e) => onChange(e.target.value)} /></label>; }
 function Select({ label, value, onChange, options }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><select className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={value} onChange={(e) => onChange(e.target.value)}>{options.map((o) => <option key={o}>{o}</option>)}</select></label>; }
 
-function DocUpload({ docs = [], onChange }) {
+function DocUpload({ documents = [], uploading, onChange }) {
   return (
     <div>
-      <label className="inline-flex items-center gap-1 text-xs cursor-pointer text-slate-700">
+      <label className={`inline-flex items-center gap-1 text-xs text-slate-700 ${uploading ? "cursor-wait opacity-60" : "cursor-pointer"}`}>
         <Upload size={14} />
-        Upload
-        <input type="file" multiple className="hidden" onChange={(e) => onChange(e.target.files)} />
+        {uploading ? "Uploading" : "Upload"}
+        <input type="file" multiple className="hidden" disabled={uploading} onChange={(e) => onChange(e.target.files)} />
       </label>
 
-      <div className="text-xs text-slate-500 mt-1">{docs.length ? docs.join(", ") : "-"}</div>
+      <div className="mt-1 space-y-1 text-xs text-slate-500">
+        {documents.length
+          ? documents.map((document) => (
+            <a key={document.id || document.file_url} href={document.file_url} className="block text-slate-700 underline-offset-2 hover:underline" target="_blank" rel="noreferrer">
+              {document.file_name}
+            </a>
+          ))
+          : "-"}
+      </div>
     </div>
   );
 }
