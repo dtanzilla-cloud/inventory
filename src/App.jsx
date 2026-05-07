@@ -17,6 +17,8 @@ import { supabase } from "./supabaseClient";
 
 const warehouses = ["All", "Warehouse A", "Warehouse B", "Warehouse C", "Warehouse D", "Warehouse E"];
 const DOCUMENT_BUCKET = "activity-documents";
+const CHARGE_INVOICE_BUCKET = "charge-invoices";
+const DEFAULT_CHARGE_MONTH = "December 2025";
 
 const emptyDraft = {
   activity_date: new Date().toISOString().slice(0, 10),
@@ -31,41 +33,101 @@ const emptyDraft = {
   note: "",
 };
 
-const chargeMonths = {
-  "December 2025": {
-    storageRate: 6,
-    inboundRate: 10,
-    outboundRate: 10,
-    storageSubtotal: 1260,
-    inboundSubtotal: 370,
-    outboundSubtotal: 160,
-    total: 1790,
-    invoices: ["24202.pdf", "24201.pdf"],
-    weekly: [
-      ["Dec 1 - Dec 7", 34, 204],
-      ["Dec 8 - Dec 14", 31, 186],
-      ["Dec 15 - Dec 21", 27, 162],
-      ["Dec 22 - Dec 28", 59, 354],
-      ["Dec 29 - Dec 31", 59, 354],
-    ],
-    inbound: [
-      ["Dec 5", "grapeseed-oil", "Grapeseed Oil", 1, 10],
-      ["Dec 9", "hfe-347", "HFE-347", 3, 30],
-      ["Dec 22", "stearic-acid", "Stearic Acid", 32, 320],
-      ["Dec 22", "mct-oil-organic-certified", "MCT Oil organic certified", 1, 10],
-    ],
-    outbound: [
-      ["Dec 1", "refined-glycerin", "Refined glycerin", 4, 40],
-      ["Dec 5", "refined-glycerin", "Refined glycerin", 4, 40],
-      ["Dec 11", "hfe-347", "HFE-347", 2, 20],
-      ["Dec 11", "stearic-acid-1895", "Stearic Acid 1895", 5, 50],
-      ["Dec 18", "hfe-347", "HFE-347", 1, 10],
-    ],
-  },
-};
-
 function money(n) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+function toMonthKey(dateValue) {
+  return (dateValue || "").slice(0, 7);
+}
+
+function monthLabelFromKey(monthKey) {
+  const [year, month] = monthKey.split("-").map(Number);
+  if (!year || !month) return DEFAULT_CHARGE_MONTH;
+  return new Date(year, month - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function monthKeyFromLabel(label) {
+  const date = new Date(`${label} 1`);
+  if (Number.isNaN(date.getTime())) return "2025-12";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function shortDate(dateValue) {
+  const date = new Date(`${dateValue}T00:00:00`);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function slugify(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+function activityUnits(activity) {
+  const pallets = Math.abs(Number(activity.pallets) || 0);
+  return pallets || Math.abs(Number(activity.pieces) || 0);
+}
+
+function buildWeeklyStorageRows(monthKey, activities, storageRate) {
+  const [year, month] = monthKey.split("-").map(Number);
+  const lastDay = new Date(year, month, 0).getDate();
+  const rows = [];
+
+  for (let start = 1; start <= lastDay; start += 7) {
+    const end = Math.min(start + 6, lastDay);
+    const endDate = `${monthKey}-${String(end).padStart(2, "0")}`;
+    const units = activities
+      .filter((activity) => activity.activity_date <= endDate)
+      .reduce((sum, activity) => sum + Number(activity.pieces || 0), 0);
+    const unitsOnHand = Math.max(0, units);
+
+    rows.push([
+      `${shortDate(`${monthKey}-${String(start).padStart(2, "0")}`)} - ${shortDate(endDate)}`,
+      unitsOnHand,
+      unitsOnHand * storageRate,
+    ]);
+  }
+
+  return rows;
+}
+
+function calculateCharges(monthKey, activities, rates, invoices) {
+  const storageRate = Number(rates?.storage_rate ?? 6);
+  const inboundRate = Number(rates?.inbound_rate ?? 10);
+  const outboundRate = Number(rates?.outbound_rate ?? 10);
+  const monthlyActivities = activities.filter((activity) => toMonthKey(activity.activity_date) === monthKey);
+
+  const inbound = monthlyActivities
+    .filter((activity) => Number(activity.pieces) > 0)
+    .map((activity) => {
+      const units = activityUnits(activity);
+      return [shortDate(activity.activity_date), slugify(activity.product), activity.product, units, units * inboundRate];
+    });
+
+  const outbound = monthlyActivities
+    .filter((activity) => Number(activity.pieces) < 0)
+    .map((activity) => {
+      const units = activityUnits(activity);
+      return [shortDate(activity.activity_date), slugify(activity.product), activity.product, units, units * outboundRate];
+    });
+
+  const weekly = buildWeeklyStorageRows(monthKey, activities, storageRate);
+  const storageSubtotal = weekly.reduce((sum, row) => sum + row[2], 0);
+  const inboundSubtotal = inbound.reduce((sum, row) => sum + row[4], 0);
+  const outboundSubtotal = outbound.reduce((sum, row) => sum + row[4], 0);
+
+  return {
+    storageRate,
+    inboundRate,
+    outboundRate,
+    storageSubtotal,
+    inboundSubtotal,
+    outboundSubtotal,
+    total: storageSubtotal + inboundSubtotal + outboundSubtotal,
+    invoices,
+    weekly,
+    inbound,
+    outbound,
+  };
 }
 
 function normalizeActivity(activity) {
@@ -122,12 +184,17 @@ export default function InventoryManagementSystem() {
   const [warehouse, setWarehouse] = useState("All");
   const [activities, setActivities] = useState([]);
   const [query, setQuery] = useState("");
-  const [month, setMonth] = useState("December 2025");
+  const [month, setMonth] = useState(DEFAULT_CHARGE_MONTH);
+  const [billingRates, setBillingRates] = useState({});
+  const [chargeInvoices, setChargeInvoices] = useState({});
+  const [chargeMonths, setChargeMonths] = useState([DEFAULT_CHARGE_MONTH]);
   const [draft, setDraft] = useState(emptyDraft);
   const [authLoading, setAuthLoading] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [chargesLoading, setChargesLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
+  const [uploadingInvoice, setUploadingInvoice] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -141,6 +208,8 @@ export default function InventoryManagementSystem() {
         setProfile(null);
         setActivities([]);
         setProfiles([]);
+        setBillingRates({});
+        setChargeInvoices({});
       }
     });
 
@@ -156,7 +225,10 @@ export default function InventoryManagementSystem() {
   useEffect(() => {
     if (!profile) return;
     loadActivities(profile);
-    if (profile.role === "owner") loadProfiles();
+    if (profile.role === "owner") {
+      loadProfiles();
+      loadCharges();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
@@ -257,6 +329,46 @@ export default function InventoryManagementSystem() {
     setLoading(false);
   }
 
+  async function loadCharges() {
+    setChargesLoading(true);
+
+    const [ratesResult, invoicesResult, summariesResult] = await Promise.all([
+      supabase.from("billing_rates").select("month, storage_rate, inbound_rate, outbound_rate").order("month", { ascending: false }),
+      supabase.from("charge_invoices").select("id, month, file_name, file_url, status").order("created_at", { ascending: false }),
+      supabase.from("monthly_charge_summaries").select("*").order("month", { ascending: false }),
+    ]);
+
+    if (ratesResult.error || invoicesResult.error || summariesResult.error) {
+      console.error(ratesResult.error || invoicesResult.error || summariesResult.error);
+      setErrorMessage("Charges could not be loaded from Supabase.");
+      setChargesLoading(false);
+      return;
+    }
+
+    const nextRates = (ratesResult.data || []).reduce((acc, rate) => {
+      acc[rate.month] = rate;
+      return acc;
+    }, {});
+    const nextInvoices = (invoicesResult.data || []).reduce((acc, invoice) => {
+      acc[invoice.month] = [...(acc[invoice.month] || []), invoice];
+      return acc;
+    }, {});
+    const months = new Set([
+      ...Object.keys(nextRates),
+      ...Object.keys(nextInvoices),
+      ...(summariesResult.data || []).map((summary) => summary.month),
+      ...activities.map((activity) => toMonthKey(activity.activity_date)).filter(Boolean),
+      monthKeyFromLabel(DEFAULT_CHARGE_MONTH),
+    ]);
+    const labels = Array.from(months).sort().reverse().map(monthLabelFromKey);
+
+    setBillingRates(nextRates);
+    setChargeInvoices(nextInvoices);
+    setChargeMonths(labels);
+    if (!labels.includes(month)) setMonth(labels[0] || DEFAULT_CHARGE_MONTH);
+    setChargesLoading(false);
+  }
+
   const visibleActivities = activities.filter(
     (a) =>
       (warehouse === "All" || a.warehouse === warehouse) &&
@@ -268,6 +380,13 @@ export default function InventoryManagementSystem() {
     () => inventoryRows.filter((i) => warehouse === "All" || i.warehouse === warehouse),
     [inventoryRows, warehouse],
   );
+  const visibleChargeMonths = useMemo(
+    () => Array.from(new Set([
+      ...chargeMonths,
+      ...activities.map((activity) => monthLabelFromKey(toMonthKey(activity.activity_date))).filter(Boolean),
+    ])).sort((a, b) => monthKeyFromLabel(b).localeCompare(monthKeyFromLabel(a))),
+    [activities, chargeMonths],
+  );
   const totals = visibleInventory.reduce(
     (acc, r) => ({
       in_qty: acc.in_qty + r.in_qty,
@@ -276,7 +395,13 @@ export default function InventoryManagementSystem() {
     }),
     { in_qty: 0, reserved_qty: 0, incoming_qty: 0 },
   );
-  const charges = chargeMonths[month];
+  const chargeMonthKey = monthKeyFromLabel(month);
+  const charges = calculateCharges(
+    chargeMonthKey,
+    activities,
+    billingRates[chargeMonthKey],
+    chargeInvoices[chargeMonthKey] || [],
+  );
 
   async function addEvent() {
     if (!draft.product || !profile) return;
@@ -374,6 +499,75 @@ export default function InventoryManagementSystem() {
     }
   }
 
+  async function saveBillingRates(monthLabel, nextRates) {
+    const targetMonth = monthKeyFromLabel(monthLabel);
+    const payload = {
+      month: targetMonth,
+      storage_rate: Number(nextRates.storageRate),
+      inbound_rate: Number(nextRates.inboundRate),
+      outbound_rate: Number(nextRates.outboundRate),
+    };
+
+    const { data, error } = await supabase
+      .from("billing_rates")
+      .upsert(payload, { onConflict: "month" })
+      .select("month, storage_rate, inbound_rate, outbound_rate")
+      .single();
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("Billing rates could not be saved.");
+      return;
+    }
+
+    setBillingRates((current) => ({ ...current, [targetMonth]: data }));
+  }
+
+  async function uploadChargeInvoices(monthLabel, fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+
+    const targetMonth = monthKeyFromLabel(monthLabel);
+    setUploadingInvoice(true);
+    setErrorMessage("");
+
+    try {
+      const uploadedInvoices = [];
+
+      for (const file of files) {
+        const storagePath = `${targetMonth}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
+        const { error: uploadError } = await supabase.storage
+          .from(CHARGE_INVOICE_BUCKET)
+          .upload(storagePath, file, { upsert: false, contentType: file.type || "application/pdf" });
+
+        if (uploadError) throw uploadError;
+
+        const { data: publicUrlData } = supabase.storage
+          .from(CHARGE_INVOICE_BUCKET)
+          .getPublicUrl(storagePath);
+
+        const { data: invoice, error: invoiceError } = await supabase
+          .from("charge_invoices")
+          .insert([{ month: targetMonth, file_name: file.name, file_url: publicUrlData.publicUrl, status: "PAID" }])
+          .select("id, month, file_name, file_url, status")
+          .single();
+
+        if (invoiceError) throw invoiceError;
+        uploadedInvoices.push(invoice);
+      }
+
+      setChargeInvoices((current) => ({
+        ...current,
+        [targetMonth]: [...(current[targetMonth] || []), ...uploadedInvoices],
+      }));
+    } catch (error) {
+      console.error(error);
+      setErrorMessage("Invoice upload failed. Please try again.");
+    } finally {
+      setUploadingInvoice(false);
+    }
+  }
+
   if (authLoading) {
     return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">Loading...</div>;
   }
@@ -399,7 +593,7 @@ export default function InventoryManagementSystem() {
 
           {profile.role === "owner" && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-            {Object.keys(chargeMonths).map((m) => <NavButton key={m} icon={<DollarSign size={18} />} active={section === "Charges" && month === m} onClick={() => { setSection("Charges"); setMonth(m); }}>{m}</NavButton>)}
+            {visibleChargeMonths.map((m) => <NavButton key={m} icon={<DollarSign size={18} />} active={section === "Charges" && month === m} onClick={() => { setSection("Charges"); setMonth(m); }}>{m}</NavButton>)}
 
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
             <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
@@ -415,7 +609,7 @@ export default function InventoryManagementSystem() {
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading, profile }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} totals={totals} />}
-            {section === "Charges" && profile.role === "owner" && <ChargesView month={month} charges={charges} />}
+            {section === "Charges" && profile.role === "owner" && <ChargesView month={month} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
             {section === "Settings" && profile.role === "owner" && <SettingsView profiles={profiles} />}
           </motion.div>
         </main>
@@ -509,13 +703,61 @@ function InventoryView({ warehouse, rows, totals }) {
   </>;
 }
 
-function ChargesView({ month, charges }) {
+function ChargesView({ month, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices }) {
+  const [editingRates, setEditingRates] = useState(false);
+  const [rateDraft, setRateDraft] = useState({
+    storageRate: charges.storageRate,
+    inboundRate: charges.inboundRate,
+    outboundRate: charges.outboundRate,
+  });
+
+  async function saveRates() {
+    await onSaveRates(month, rateDraft);
+    setEditingRates(false);
+  }
+
   return <>
     <Header title={`Charges - ${month}`} subtitle="Storage, inbound handling, outbound handling, invoices, and charge details." />
+    {loading && <div className="mb-4 rounded-xl border bg-white px-4 py-3 text-sm text-slate-500">Loading charges...</div>}
     <div className="grid grid-cols-4 gap-4 mb-6"><KPI label="Storage" value={money(charges.storageSubtotal)} /><KPI label="Inbound" value={money(charges.inboundSubtotal)} /><KPI label="Outbound" value={money(charges.outboundSubtotal)} /><KPI label="Total" value={money(charges.total)} /></div>
     <div className="grid grid-cols-3 gap-6 mb-6">
-      <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><h3 className="font-semibold mb-2">Billing Rates</h3><Rate label="Storage" value={`${money(charges.storageRate)} / unit / week`} /><Rate label="Inbound" value={`${money(charges.inboundRate)} / HU`} /><Rate label="Outbound" value={`${money(charges.outboundRate)} / HU`} /><Button variant="outline" className="mt-4 rounded-xl">Edit rates</Button></CardContent></Card>
-      <Card className="rounded-2xl shadow-sm col-span-2"><CardContent className="p-5"><h3 className="font-semibold mb-2 flex items-center gap-2"><FileText size={18} />Invoices</h3>{charges.invoices.map((i) => <div key={i} className="flex justify-between border-b py-3"><span>{i}</span><span className="text-green-700 font-medium">PAID</span></div>)}<Button variant="outline" className="mt-4 rounded-xl"><Upload size={16} className="mr-2" />Attach PDF invoice</Button></CardContent></Card>
+      <Card className="rounded-2xl shadow-sm"><CardContent className="p-5">
+        <h3 className="font-semibold mb-2">Billing Rates</h3>
+        {editingRates ? <>
+          <Input label="Storage" type="number" value={rateDraft.storageRate} onChange={(value) => setRateDraft({ ...rateDraft, storageRate: value })} />
+          <Input label="Inbound" type="number" value={rateDraft.inboundRate} onChange={(value) => setRateDraft({ ...rateDraft, inboundRate: value })} />
+          <Input label="Outbound" type="number" value={rateDraft.outboundRate} onChange={(value) => setRateDraft({ ...rateDraft, outboundRate: value })} />
+          <div className="mt-4 flex gap-2">
+            <Button onClick={saveRates}>Save</Button>
+            <Button variant="outline" onClick={() => setEditingRates(false)}>Cancel</Button>
+          </div>
+        </> : <>
+          <Rate label="Storage" value={`${money(charges.storageRate)} / unit / week`} />
+          <Rate label="Inbound" value={`${money(charges.inboundRate)} / HU`} />
+          <Rate label="Outbound" value={`${money(charges.outboundRate)} / HU`} />
+          <Button variant="outline" className="mt-4 rounded-xl" onClick={() => {
+            setRateDraft({
+              storageRate: charges.storageRate,
+              inboundRate: charges.inboundRate,
+              outboundRate: charges.outboundRate,
+            });
+            setEditingRates(true);
+          }}>Edit rates</Button>
+        </>}
+      </CardContent></Card>
+      <Card className="rounded-2xl shadow-sm col-span-2"><CardContent className="p-5">
+        <h3 className="font-semibold mb-2 flex items-center gap-2"><FileText size={18} />Invoices</h3>
+        {charges.invoices.length ? charges.invoices.map((invoice) => (
+          <div key={invoice.id || invoice.file_url} className="flex justify-between border-b py-3">
+            <a href={invoice.file_url} target="_blank" rel="noreferrer" className="underline-offset-2 hover:underline">{invoice.file_name}</a>
+            <span className="text-green-700 font-medium">{invoice.status || "PAID"}</span>
+          </div>
+        )) : <div className="border-b py-3 text-sm text-slate-500">No invoices uploaded.</div>}
+        <label className={`mt-4 inline-flex items-center justify-center px-4 py-2 rounded-xl text-sm font-medium transition border border-slate-300 bg-white hover:bg-slate-100 ${uploadingInvoice ? "cursor-wait opacity-60" : "cursor-pointer"}`}>
+          <Upload size={16} className="mr-2" />{uploadingInvoice ? "Uploading invoice" : "Attach PDF invoice"}
+          <input type="file" accept="application/pdf" multiple className="hidden" disabled={uploadingInvoice} onChange={(event) => onUploadInvoices(month, event.target.files)} />
+        </label>
+      </CardContent></Card>
     </div>
     <SectionTable title="Weekly Storage Breakdown" headers={["Period", "Units on hand", "Rate", "Charge"]} rows={charges.weekly.map((w) => [w[0], w[1], money(charges.storageRate), money(w[2])])} />
     <SectionTable title="Inbound Movements" headers={["Date", "SKU", "Description", "HU", "Charge"]} rows={charges.inbound.map((r) => [r[0], r[1], r[2], r[3], money(r[4])])} />
