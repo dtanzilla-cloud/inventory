@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
-const warehouses = ["All", "Warehouse A", "Warehouse B", "Warehouse C", "Warehouse D", "Warehouse E"];
+const warehouses = ["All", "Warehouse A"];
 const DOCUMENT_BUCKET = "activity-documents";
 const CHARGE_INVOICE_BUCKET = "charge-invoices";
 const DEFAULT_CHARGE_MONTH = "December 2025";
