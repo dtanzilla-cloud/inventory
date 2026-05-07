@@ -63,8 +63,13 @@ function slugify(value) {
 }
 
 function activityUnits(activity) {
-  const pallets = Math.abs(Number(activity.pallets) || 0);
-  return pallets || Math.abs(Number(activity.pieces) || 0);
+  return Math.abs(Number(activity.pallets) || 0);
+}
+
+function signedActivityUnits(activity) {
+  const pallets = Number(activity.pallets) || 0;
+  if (pallets === 0) return 0;
+  return Number(activity.pieces) < 0 ? -Math.abs(pallets) : Math.abs(pallets);
 }
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
@@ -74,15 +79,18 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
 
   for (let start = 1; start <= lastDay; start += 7) {
     const end = Math.min(start + 6, lastDay);
+    const startDate = `${monthKey}-${String(start).padStart(2, "0")}`;
     const endDate = `${monthKey}-${String(end).padStart(2, "0")}`;
     const units = activities
-      .filter((activity) => activity.activity_date <= endDate)
-      .reduce((sum, activity) => sum + Number(activity.pieces || 0), 0);
+      .filter((activity) => activity.activity_date < startDate)
+      .reduce((sum, activity) => sum + signedActivityUnits(activity), 0);
     const unitsOnHand = Math.max(0, units);
 
     rows.push([
+      rows.length + 1,
       `${shortDate(`${monthKey}-${String(start).padStart(2, "0")}`)} - ${shortDate(endDate)}`,
       unitsOnHand,
+      storageRate,
       unitsOnHand * storageRate,
     ]);
   }
@@ -111,7 +119,7 @@ function calculateCharges(monthKey, activities, rates, invoices) {
     });
 
   const weekly = buildWeeklyStorageRows(monthKey, activities, storageRate);
-  const storageSubtotal = weekly.reduce((sum, row) => sum + row[2], 0);
+  const storageSubtotal = weekly.reduce((sum, row) => sum + row[4], 0);
   const inboundSubtotal = inbound.reduce((sum, row) => sum + row[4], 0);
   const outboundSubtotal = outbound.reduce((sum, row) => sum + row[4], 0);
 
@@ -151,7 +159,7 @@ export default function InventoryManagementSystem() {
   const [activities, setActivities] = useState([]);
   const [inventoryLedger, setInventoryLedger] = useState([]);
   const [query, setQuery] = useState("");
-  const [month, setMonth] = useState(DEFAULT_CHARGE_MONTH);
+  const [month, setMonth] = useState("");
   const [billingRates, setBillingRates] = useState({});
   const [chargeInvoices, setChargeInvoices] = useState({});
   const [chargeMonths, setChargeMonths] = useState([DEFAULT_CHARGE_MONTH]);
@@ -359,7 +367,6 @@ export default function InventoryManagementSystem() {
     setBillingRates(nextRates);
     setChargeInvoices(nextInvoices);
     setChargeMonths(labels);
-    if (!labels.includes(month)) setMonth(labels[0] || DEFAULT_CHARGE_MONTH);
     setChargesLoading(false);
   }
 
@@ -380,6 +387,7 @@ export default function InventoryManagementSystem() {
     ])).sort((a, b) => monthKeyFromLabel(b).localeCompare(monthKeyFromLabel(a))),
     [activities, chargeMonths],
   );
+  const selectedChargeMonth = month || visibleChargeMonths[0] || DEFAULT_CHARGE_MONTH;
   const totals = visibleInventory.reduce(
     (acc, r) => ({
       in_qty: acc.in_qty + Number(r.in_qty || 0),
@@ -389,7 +397,7 @@ export default function InventoryManagementSystem() {
     }),
     { in_qty: 0, reserved_qty: 0, incoming_qty: 0, available_qty: 0 },
   );
-  const chargeMonthKey = monthKeyFromLabel(month);
+  const chargeMonthKey = monthKeyFromLabel(selectedChargeMonth);
   const charges = calculateCharges(
     chargeMonthKey,
     activities,
@@ -589,7 +597,7 @@ export default function InventoryManagementSystem() {
 
           {profile.role === "owner" && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-            {visibleChargeMonths.map((m) => <NavButton key={m} icon={<DollarSign size={18} />} active={section === "Charges" && month === m} onClick={() => { setSection("Charges"); setMonth(m); }}>{m}</NavButton>)}
+            <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
 
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
             <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
@@ -605,7 +613,7 @@ export default function InventoryManagementSystem() {
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading, profile }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} totals={totals} />}
-            {section === "Charges" && profile.role === "owner" && <ChargesView month={month} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
+            {section === "Charges" && profile.role === "owner" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
             {section === "Settings" && profile.role === "owner" && <SettingsView profiles={profiles} />}
           </motion.div>
         </main>
@@ -686,7 +694,7 @@ function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, a
     {loading ? (
       <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">Loading activities...</div>
     ) : (
-      <Table headers={["Date", "Whse", "Pallet", "Pieces", "Product", "Customer", "Supplier", "Docs", ""]} rows={visibleActivities.map((a) => [a.activity_date, a.warehouse, a.pallets, a.pieces, a.product, a.customer || "-", a.supplier || "-", <DocUpload key={a.id} documents={a.documents} uploading={uploadingActivityId === a.id} onChange={(files) => uploadDocuments(a.id, files)} />, <Button key="del" size="sm" variant="ghost" onClick={() => deleteActivity(a.id)}><Trash2 size={16} /></Button>])} />
+      <Table headers={["Date", "Pallet", "Pieces", "Product", "Customer", "Supplier", "Docs", ""]} rows={visibleActivities.map((a) => [a.activity_date, a.pallets, a.pieces, a.product, a.customer || "-", a.supplier || "-", <DocUpload key={a.id} documents={a.documents} uploading={uploadingActivityId === a.id} onChange={(files) => uploadDocuments(a.id, files)} />, <Button key="del" size="sm" variant="ghost" onClick={() => deleteActivity(a.id)}><Trash2 size={16} /></Button>])} />
     )}
   </>;
 }
@@ -695,11 +703,11 @@ function InventoryView({ warehouse, rows, totals }) {
   return <>
     <Header title={`Inventory - ${warehouse}`} subtitle="In = inventory before today; Reserved = future outbound; Incoming = future inbound." />
     <div className="grid grid-cols-3 gap-4 mb-6"><KPI label="In" value={totals.in_qty} /><KPI label="Reserved" value={totals.reserved_qty} /><KPI label="Incoming" value={totals.incoming_qty} /></div>
-    <Table headers={["Item", "Warehouse", "In", "Reserved", "Incoming", "Available"]} rows={rows.map((r) => [r.item, r.warehouse, r.in_qty, r.reserved_qty, r.incoming_qty, r.available_qty])} />
+    <Table headers={["Item", "In", "Reserved", "Incoming", "Available"]} rows={rows.map((r) => [r.item, r.in_qty, r.reserved_qty, r.incoming_qty, r.available_qty])} />
   </>;
 }
 
-function ChargesView({ month, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices }) {
+function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices }) {
   const [editingRates, setEditingRates] = useState(false);
   const [rateDraft, setRateDraft] = useState({
     storageRate: charges.storageRate,
@@ -714,6 +722,9 @@ function ChargesView({ month, charges, loading, uploadingInvoice, onSaveRates, o
 
   return <>
     <Header title={`Charges - ${month}`} subtitle="Storage, inbound handling, outbound handling, invoices, and charge details." />
+    <div className="mb-4 max-w-xs">
+      <Select label="Month" value={month} onChange={setMonth} options={months} />
+    </div>
     {loading && <div className="mb-4 rounded-xl border bg-white px-4 py-3 text-sm text-slate-500">Loading charges...</div>}
     <div className="grid grid-cols-4 gap-4 mb-6"><KPI label="Storage" value={money(charges.storageSubtotal)} /><KPI label="Inbound" value={money(charges.inboundSubtotal)} /><KPI label="Outbound" value={money(charges.outboundSubtotal)} /><KPI label="Total" value={money(charges.total)} /></div>
     <div className="grid grid-cols-3 gap-6 mb-6">
@@ -755,9 +766,9 @@ function ChargesView({ month, charges, loading, uploadingInvoice, onSaveRates, o
         </label>
       </CardContent></Card>
     </div>
-    <SectionTable title="Weekly Storage Breakdown" headers={["Period", "Units on hand", "Rate", "Charge"]} rows={charges.weekly.map((w) => [w[0], w[1], money(charges.storageRate), money(w[2])])} />
-    <SectionTable title="Inbound Movements" headers={["Date", "SKU", "Description", "HU", "Charge"]} rows={charges.inbound.map((r) => [r[0], r[1], r[2], r[3], money(r[4])])} />
-    <SectionTable title="Outbound Movements" headers={["Date", "SKU", "Description", "HU", "Charge"]} rows={charges.outbound.map((r) => [r[0], r[1], r[2], r[3], money(r[4])])} />
+    <SectionTable title="Weekly Storage Breakdown" headers={["Week", "Period", "HU on hand", "Rate", "Charge"]} rows={charges.weekly.map((w) => [w[0], w[1], w[2], money(w[3]), money(w[4])])} />
+    <SectionTable title="Inbound Movements" headers={["Date", "SKU", "Description", "Pallet", "Charge"]} rows={charges.inbound.map((r) => [r[0], r[1], r[2], r[3], money(r[4])])} />
+    <SectionTable title="Outbound Movements" headers={["Date", "SKU", "Description", "Pallet", "Charge"]} rows={charges.outbound.map((r) => [r[0], r[1], r[2], r[3], money(r[4])])} />
   </>;
 }
 
