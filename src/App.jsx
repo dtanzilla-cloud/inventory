@@ -303,7 +303,7 @@ export default function InventoryManagementSystem() {
 
     let ledgerQuery = supabase
       .from("inventory_ledger")
-      .select("item, warehouse, in_qty, reserved_qty, incoming_qty, available_qty")
+      .select("*")
       .order("warehouse", { ascending: true })
       .order("item", { ascending: true });
 
