@@ -6,6 +6,8 @@ import {
   Trash2,
   Upload,
   FileText,
+  LogIn,
+  LogOut,
   Settings,
   Warehouse,
   Activity,
@@ -14,7 +16,8 @@ import {
 import { supabase } from "./supabaseClient";
 
 const warehouses = ["All", "Warehouse A", "Warehouse B", "Warehouse C", "Warehouse D", "Warehouse E"];
-const users = ["Adeline (Owner)", "Warehouse A", "Warehouse B", "Warehouse C", "Warehouse D", "Warehouse E"];
+const DOCUMENT_BUCKET = "activity-documents";
+
 const emptyDraft = {
   activity_date: new Date().toISOString().slice(0, 10),
   warehouse: "Warehouse A",
@@ -27,8 +30,6 @@ const emptyDraft = {
   repack: "",
   note: "",
 };
-
-const DOCUMENT_BUCKET = "activity-documents";
 
 const chargeMonths = {
   "December 2025": {
@@ -114,29 +115,106 @@ function deriveInventoryRows(activities) {
 }
 
 export default function InventoryManagementSystem() {
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [profiles, setProfiles] = useState([]);
   const [section, setSection] = useState("Activities");
   const [warehouse, setWarehouse] = useState("All");
   const [activities, setActivities] = useState([]);
   const [query, setQuery] = useState("");
   const [month, setMonth] = useState("December 2025");
   const [draft, setDraft] = useState(emptyDraft);
-  const [loading, setLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
 
   useEffect(() => {
-    loadActivities();
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      if (!nextSession) {
+        setProfile(null);
+        setActivities([]);
+        setProfiles([]);
+      }
+    });
+
+    return () => listener.subscription.unsubscribe();
   }, []);
 
-  async function loadActivities() {
+  useEffect(() => {
+    if (!session?.user) return;
+    loadProfile(session.user);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
+  useEffect(() => {
+    if (!profile) return;
+    loadActivities(profile);
+    if (profile.role === "owner") loadProfiles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile]);
+
+  async function loadProfile(user) {
+    setErrorMessage("");
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, role, warehouse")
+      .eq("id", user.id)
+      .single();
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("No profile is configured for this user.");
+      setProfile(null);
+      return;
+    }
+
+    if (data.role === "warehouse") {
+      setWarehouse(data.warehouse);
+      setDraft((current) => ({ ...current, warehouse: data.warehouse }));
+      if (section === "Charges" || section === "Settings") setSection("Activities");
+    }
+
+    setProfile(data);
+  }
+
+  async function loadProfiles() {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, role, warehouse")
+      .order("email", { ascending: true });
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("Settings loaded, but user profiles could not be loaded.");
+    } else {
+      setProfiles(data || []);
+    }
+  }
+
+  async function loadActivities(activeProfile = profile) {
+    if (!activeProfile) return;
+
     setLoading(true);
     setErrorMessage("");
 
-    // Future auth policy point: replace broad reads with warehouse-scoped RLS once users sign in.
-    const { data, error } = await supabase
+    let activityQuery = supabase
       .from("activities")
       .select("*")
       .order("activity_date", { ascending: false });
+
+    if (activeProfile.role === "warehouse") {
+      activityQuery = activityQuery.eq("warehouse", activeProfile.warehouse);
+    }
+
+    const { data, error } = await activityQuery;
 
     if (error) {
       console.error(error);
@@ -201,11 +279,11 @@ export default function InventoryManagementSystem() {
   const charges = chargeMonths[month];
 
   async function addEvent() {
-    if (!draft.product) return;
+    if (!draft.product || !profile) return;
 
     const payload = {
       activity_date: draft.activity_date,
-      warehouse: draft.warehouse,
+      warehouse: profile.role === "warehouse" ? profile.warehouse : draft.warehouse,
       pallets: Number(draft.pallets),
       pieces: Number(draft.pieces),
       product: draft.product,
@@ -216,7 +294,6 @@ export default function InventoryManagementSystem() {
       note: draft.note,
     };
 
-    // Future auth policy point: RLS should restrict inserts to the user's allowed warehouse(s).
     const { error } = await supabase.from("activities").insert([payload]);
 
     if (error) {
@@ -226,13 +303,12 @@ export default function InventoryManagementSystem() {
     }
 
     await loadActivities();
-    setDraft(emptyDraft);
+    setDraft({ ...emptyDraft, warehouse: profile.role === "warehouse" ? profile.warehouse : "Warehouse A" });
   }
 
   async function deleteActivity(id) {
     if (!id) return;
 
-    // Future auth policy point: RLS should restrict deletes to owners or permitted warehouse users.
     const { error } = await supabase.from("activities").delete().eq("id", id);
 
     if (error) {
@@ -257,7 +333,6 @@ export default function InventoryManagementSystem() {
       for (const file of files) {
         const storagePath = `${activityId}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
 
-        // Future auth policy point: Storage and documents RLS should require access to this activity.
         const { error: uploadError } = await supabase.storage
           .from(DOCUMENT_BUCKET)
           .upload(storagePath, file, { upsert: false });
@@ -299,6 +374,14 @@ export default function InventoryManagementSystem() {
     }
   }
 
+  if (authLoading) {
+    return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">Loading...</div>;
+  }
+
+  if (!session || !profile) {
+    return <LoginView errorMessage={errorMessage} isSignedIn={Boolean(session)} />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <div className="flex">
@@ -306,30 +389,75 @@ export default function InventoryManagementSystem() {
           <div className="mb-8">
             <div className="text-xl font-bold">Adeline Inventory</div>
             <div className="text-sm text-slate-500">Online warehouse portal</div>
+            <div className="mt-3 text-xs text-slate-500">{profile.email}</div>
           </div>
 
           <NavButton icon={<Activity size={18} />} active={section === "Activities"} onClick={() => setSection("Activities")}>Activities</NavButton>
 
           <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Inventory</div>
-          {warehouses.map((w) => <NavButton key={w} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === w} onClick={() => { setSection("Inventory"); setWarehouse(w); }}>{w}</NavButton>)}
+          {(profile.role === "owner" ? warehouses : [profile.warehouse]).map((w) => <NavButton key={w} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === w} onClick={() => { setSection("Inventory"); setWarehouse(w); }}>{w}</NavButton>)}
 
-          <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-          {Object.keys(chargeMonths).map((m) => <NavButton key={m} icon={<DollarSign size={18} />} active={section === "Charges" && month === m} onClick={() => { setSection("Charges"); setMonth(m); }}>{m}</NavButton>)}
+          {profile.role === "owner" && <>
+            <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
+            {Object.keys(chargeMonths).map((m) => <NavButton key={m} icon={<DollarSign size={18} />} active={section === "Charges" && month === m} onClick={() => { setSection("Charges"); setMonth(m); }}>{m}</NavButton>)}
 
-          <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
-          <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
+            <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
+            <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
+          </>}
+
+          <div className="mt-8 pt-4 border-t border-slate-200">
+            <Button variant="outline" className="w-full" onClick={() => supabase.auth.signOut()}><LogOut size={16} className="mr-2" />Log out</Button>
+          </div>
         </aside>
 
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading }} />}
+            {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading, profile }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} totals={totals} />}
-            {section === "Charges" && <ChargesView month={month} charges={charges} />}
-            {section === "Settings" && <SettingsView />}
+            {section === "Charges" && profile.role === "owner" && <ChargesView month={month} charges={charges} />}
+            {section === "Settings" && profile.role === "owner" && <SettingsView profiles={profiles} />}
           </motion.div>
         </main>
       </div>
+    </div>
+  );
+}
+
+function LoginView({ errorMessage, isSignedIn }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function signIn(event) {
+    event.preventDefault();
+    setSubmitting(true);
+    setAuthError("");
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+
+    if (error) setAuthError(error.message);
+    setSubmitting(false);
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
+      <Card className="w-full max-w-md rounded-2xl border bg-white shadow-sm">
+        <CardContent className="p-6">
+          <div className="mb-6">
+            <h1 className="text-2xl font-bold tracking-tight">Adeline Inventory</h1>
+            <p className="text-sm text-slate-500 mt-1">Sign in with your Supabase account.</p>
+          </div>
+          {(authError || errorMessage) && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{authError || errorMessage}</div>}
+          <form onSubmit={signIn} className="space-y-4">
+            <Input label="Email" type="email" value={email} onChange={setEmail} />
+            <Input label="Password" type="password" value={password} onChange={setPassword} />
+            <Button className="w-full" disabled={submitting}><LogIn size={16} className="mr-2" />{submitting ? "Signing in" : "Log in"}</Button>
+          </form>
+          {isSignedIn && <Button type="button" variant="outline" className="mt-3 w-full" onClick={() => supabase.auth.signOut()}><LogOut size={16} className="mr-2" />Log out</Button>}
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -342,13 +470,13 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading }) {
+function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading, profile }) {
   return <>
     <Header title="Activities" subtitle="Inbound, outbound, repack, notes, and documents per event." />
     <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
       <div className="grid grid-cols-6 gap-3">
         <Input label="Date" type="date" value={draft.activity_date} onChange={(v) => setDraft({ ...draft, activity_date: v })} />
-        <Select label="Warehouse" value={draft.warehouse} onChange={(v) => setDraft({ ...draft, warehouse: v })} options={warehouses.slice(1)} />
+        <Select label="Warehouse" value={profile.role === "warehouse" ? profile.warehouse : draft.warehouse} onChange={(v) => setDraft({ ...draft, warehouse: v })} options={profile.role === "owner" ? warehouses.slice(1) : [profile.warehouse]} disabled={profile.role === "warehouse"} />
         <Input label="Activity/pallet" type="number" value={draft.pallets} onChange={(v) => setDraft({ ...draft, pallets: v })} />
         <Input label="Piece count" type="number" value={draft.pieces} onChange={(v) => setDraft({ ...draft, pieces: v })} />
         <Input label="Product" value={draft.product} onChange={(v) => setDraft({ ...draft, product: v })} />
@@ -395,17 +523,17 @@ function ChargesView({ month, charges }) {
   </>;
 }
 
-function SettingsView() {
+function SettingsView({ profiles }) {
   return <>
     <Header title="Settings - Users" subtitle="Owner and warehouse-level user access." />
-    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={users.map((u, i) => [u, i === 0 ? "Owner" : "Warehouse user", i === 0 ? "All warehouses + charges + settings" : `${u} activities and inventory only`])} /></CardContent></Card>
+    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={profiles.map((user) => [user.email, user.role, user.role === "owner" ? "All warehouses + charges + settings" : `${user.warehouse} activities and inventory only`])} /></CardContent></Card>
   </>;
 }
 
 function Header({ title, subtitle }) { return <div className="mb-6"><h1 className="text-3xl font-bold tracking-tight">{title}</h1><p className="text-slate-500 mt-1">{subtitle}</p></div>; }
 function Rate({ label, value }) { return <div className="flex justify-between py-2 border-b"><span className="text-slate-500">{label}</span><span className="font-semibold">{value}</span></div>; }
 function Input({ label, value, onChange, type = "text" }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><input type={type} className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={value} onChange={(e) => onChange(e.target.value)} /></label>; }
-function Select({ label, value, onChange, options }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><select className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={value} onChange={(e) => onChange(e.target.value)}>{options.map((o) => <option key={o}>{o}</option>)}</select></label>; }
+function Select({ label, value, onChange, options, disabled = false }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><select className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm disabled:bg-slate-100" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>{options.map((o) => <option key={o}>{o}</option>)}</select></label>; }
 
 function DocUpload({ documents = [], uploading, onChange }) {
   return (
@@ -441,7 +569,7 @@ function CardContent({ children, className = "" }) {
 }
 
 function Button({ children, className = "", variant = "default", size = "default", ...props }) {
-  const base = "inline-flex items-center justify-center px-4 py-2 rounded-xl text-sm font-medium transition";
+  const base = "inline-flex items-center justify-center px-4 py-2 rounded-xl text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60";
   const variants = {
     default: "bg-slate-900 text-white hover:bg-slate-700",
     outline: "border border-slate-300 bg-white hover:bg-slate-100",
