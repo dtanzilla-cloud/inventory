@@ -72,6 +72,24 @@ function signedActivityUnits(activity) {
   return Number(activity.pieces) < 0 ? -Math.abs(pallets) : Math.abs(pallets);
 }
 
+function inventoryKey(item, warehouse) {
+  return `${item || ""}::${warehouse || ""}`;
+}
+
+function derivePalletBalances(activities) {
+  const today = new Date().toISOString().slice(0, 10);
+
+  return activities.reduce((balances, activity) => {
+    if (!activity.product || !activity.warehouse || !activity.activity_date || activity.activity_date >= today) {
+      return balances;
+    }
+
+    const key = inventoryKey(activity.product, activity.warehouse);
+    balances.set(key, (balances.get(key) || 0) + signedActivityUnits(activity));
+    return balances;
+  }, new Map());
+}
+
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
   const [year, month] = monthKey.split("-").map(Number);
   const lastDay = new Date(year, month, 0).getDate();
@@ -376,9 +394,15 @@ export default function InventoryManagementSystem() {
       JSON.stringify(a).toLowerCase().includes(query.toLowerCase()),
   );
 
+  const palletBalances = useMemo(() => derivePalletBalances(activities), [activities]);
   const visibleInventory = useMemo(
-    () => inventoryLedger.filter((i) => warehouse === "All" || i.warehouse === warehouse),
-    [inventoryLedger, warehouse],
+    () => inventoryLedger
+      .filter((i) => warehouse === "All" || i.warehouse === warehouse)
+      .map((row) => ({
+        ...row,
+        pallets: palletBalances.get(inventoryKey(row.item, row.warehouse)) || 0,
+      })),
+    [inventoryLedger, palletBalances, warehouse],
   );
   const visibleChargeMonths = useMemo(
     () => Array.from(new Set([
@@ -693,7 +717,7 @@ function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, a
 function InventoryView({ warehouse, rows }) {
   return <>
     <Header title={`Inventory — ${warehouse}`} />
-    <Table headers={["Item", "Pallets", "Pcs", "Reserved", "Incoming"]} rows={rows.map((r) => [r.item, r.pallets ?? r.pallet_qty ?? r.handling_units ?? "-", r.in_qty, r.reserved_qty, r.incoming_qty])} />
+    <Table headers={["Item", "Pallets", "Pcs", "Reserved", "Incoming"]} rows={rows.map((r) => [r.item, r.pallets, r.in_qty, r.reserved_qty, r.incoming_qty])} />
   </>;
 }
 
