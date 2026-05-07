@@ -388,15 +388,6 @@ export default function InventoryManagementSystem() {
     [activities, chargeMonths],
   );
   const selectedChargeMonth = month || visibleChargeMonths[0] || DEFAULT_CHARGE_MONTH;
-  const totals = visibleInventory.reduce(
-    (acc, r) => ({
-      in_qty: acc.in_qty + Number(r.in_qty || 0),
-      reserved_qty: acc.reserved_qty + Number(r.reserved_qty || 0),
-      incoming_qty: acc.incoming_qty + Number(r.incoming_qty || 0),
-      available_qty: acc.available_qty + Number(r.available_qty || 0),
-    }),
-    { in_qty: 0, reserved_qty: 0, incoming_qty: 0, available_qty: 0 },
-  );
   const chargeMonthKey = monthKeyFromLabel(selectedChargeMonth);
   const charges = calculateCharges(
     chargeMonthKey,
@@ -612,7 +603,7 @@ export default function InventoryManagementSystem() {
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ visibleActivities, query, setQuery, draft, setDraft, addEvent, deleteActivity, uploadDocuments, uploadingActivityId, loading, profile }} />}
-            {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} totals={totals} />}
+            {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} />}
             {section === "Charges" && profile.role === "owner" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
             {section === "Settings" && profile.role === "owner" && <SettingsView profiles={profiles} />}
           </motion.div>
@@ -699,11 +690,10 @@ function ActivitiesView({ visibleActivities, query, setQuery, draft, setDraft, a
   </>;
 }
 
-function InventoryView({ warehouse, rows, totals }) {
+function InventoryView({ warehouse, rows }) {
   return <>
-    <Header title={`Inventory - ${warehouse}`} subtitle="In = inventory before today; Reserved = future outbound; Incoming = future inbound." />
-    <div className="grid grid-cols-3 gap-4 mb-6"><KPI label="In" value={totals.in_qty} /><KPI label="Reserved" value={totals.reserved_qty} /><KPI label="Incoming" value={totals.incoming_qty} /></div>
-    <Table headers={["Item", "In", "Reserved", "Incoming", "Available"]} rows={rows.map((r) => [r.item, r.in_qty, r.reserved_qty, r.incoming_qty, r.available_qty])} />
+    <Header title={`Inventory — ${warehouse}`} />
+    <Table headers={["Item", "Pallets", "Pcs", "Reserved", "Incoming"]} rows={rows.map((r) => [r.item, r.pallets ?? r.pallet_qty ?? r.handling_units ?? "-", r.in_qty, r.reserved_qty, r.incoming_qty])} />
   </>;
 }
 
