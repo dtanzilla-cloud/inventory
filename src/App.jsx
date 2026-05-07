@@ -142,40 +142,6 @@ function sanitizeFileName(fileName) {
   return fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function deriveInventoryRows(activities) {
-  const today = new Date().toISOString().slice(0, 10);
-  const grouped = new Map();
-
-  activities.forEach((activity) => {
-    if (!activity.product || !activity.warehouse || !activity.activity_date) return;
-
-    const key = `${activity.product}::${activity.warehouse}`;
-    const current = grouped.get(key) || {
-      item: activity.product,
-      warehouse: activity.warehouse,
-      in_qty: 0,
-      reserved_qty: 0,
-      incoming_qty: 0,
-    };
-    const pieces = Number(activity.pieces) || 0;
-
-    if (activity.activity_date < today) {
-      current.in_qty += pieces;
-    } else if (pieces < 0) {
-      current.reserved_qty += Math.abs(pieces);
-    } else if (pieces > 0) {
-      current.incoming_qty += pieces;
-    }
-
-    grouped.set(key, current);
-  });
-
-  return Array.from(grouped.values()).sort((a, b) => {
-    const byWarehouse = a.warehouse.localeCompare(b.warehouse);
-    return byWarehouse || a.item.localeCompare(b.item);
-  });
-}
-
 export default function InventoryManagementSystem() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -183,6 +149,7 @@ export default function InventoryManagementSystem() {
   const [section, setSection] = useState("Activities");
   const [warehouse, setWarehouse] = useState("All");
   const [activities, setActivities] = useState([]);
+  const [inventoryLedger, setInventoryLedger] = useState([]);
   const [query, setQuery] = useState("");
   const [month, setMonth] = useState(DEFAULT_CHARGE_MONTH);
   const [billingRates, setBillingRates] = useState({});
@@ -207,6 +174,7 @@ export default function InventoryManagementSystem() {
       if (!nextSession) {
         setProfile(null);
         setActivities([]);
+        setInventoryLedger([]);
         setProfiles([]);
         setBillingRates({});
         setChargeInvoices({});
@@ -229,6 +197,7 @@ export default function InventoryManagementSystem() {
       loadProfiles();
       loadCharges();
     }
+    loadInventoryLedger(profile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
@@ -329,6 +298,31 @@ export default function InventoryManagementSystem() {
     setLoading(false);
   }
 
+  async function loadInventoryLedger(activeProfile = profile) {
+    if (!activeProfile) return;
+
+    let ledgerQuery = supabase
+      .from("inventory_ledger")
+      .select("item, warehouse, in_qty, reserved_qty, incoming_qty, available_qty")
+      .order("warehouse", { ascending: true })
+      .order("item", { ascending: true });
+
+    if (activeProfile.role === "warehouse") {
+      ledgerQuery = ledgerQuery.eq("warehouse", activeProfile.warehouse);
+    }
+
+    const { data, error } = await ledgerQuery;
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("Inventory could not be loaded from Supabase.");
+      setInventoryLedger([]);
+      return;
+    }
+
+    setInventoryLedger(data || []);
+  }
+
   async function loadCharges() {
     setChargesLoading(true);
 
@@ -375,10 +369,9 @@ export default function InventoryManagementSystem() {
       JSON.stringify(a).toLowerCase().includes(query.toLowerCase()),
   );
 
-  const inventoryRows = useMemo(() => deriveInventoryRows(activities), [activities]);
   const visibleInventory = useMemo(
-    () => inventoryRows.filter((i) => warehouse === "All" || i.warehouse === warehouse),
-    [inventoryRows, warehouse],
+    () => inventoryLedger.filter((i) => warehouse === "All" || i.warehouse === warehouse),
+    [inventoryLedger, warehouse],
   );
   const visibleChargeMonths = useMemo(
     () => Array.from(new Set([
@@ -389,11 +382,12 @@ export default function InventoryManagementSystem() {
   );
   const totals = visibleInventory.reduce(
     (acc, r) => ({
-      in_qty: acc.in_qty + r.in_qty,
-      reserved_qty: acc.reserved_qty + r.reserved_qty,
-      incoming_qty: acc.incoming_qty + r.incoming_qty,
+      in_qty: acc.in_qty + Number(r.in_qty || 0),
+      reserved_qty: acc.reserved_qty + Number(r.reserved_qty || 0),
+      incoming_qty: acc.incoming_qty + Number(r.incoming_qty || 0),
+      available_qty: acc.available_qty + Number(r.available_qty || 0),
     }),
-    { in_qty: 0, reserved_qty: 0, incoming_qty: 0 },
+    { in_qty: 0, reserved_qty: 0, incoming_qty: 0, available_qty: 0 },
   );
   const chargeMonthKey = monthKeyFromLabel(month);
   const charges = calculateCharges(
@@ -428,6 +422,7 @@ export default function InventoryManagementSystem() {
     }
 
     await loadActivities();
+    await loadInventoryLedger();
     setDraft({ ...emptyDraft, warehouse: profile.role === "warehouse" ? profile.warehouse : "Warehouse A" });
   }
 
@@ -443,6 +438,7 @@ export default function InventoryManagementSystem() {
     }
 
     setActivities((current) => current.filter((activity) => activity.id !== id));
+    await loadInventoryLedger();
   }
 
   async function uploadDocuments(activityId, fileList) {
@@ -699,7 +695,7 @@ function InventoryView({ warehouse, rows, totals }) {
   return <>
     <Header title={`Inventory - ${warehouse}`} subtitle="In = inventory before today; Reserved = future outbound; Incoming = future inbound." />
     <div className="grid grid-cols-3 gap-4 mb-6"><KPI label="In" value={totals.in_qty} /><KPI label="Reserved" value={totals.reserved_qty} /><KPI label="Incoming" value={totals.incoming_qty} /></div>
-    <Table headers={["Item", "Warehouse", "In", "Reserved", "Incoming", "Available"]} rows={rows.map((r) => [r.item, r.warehouse, r.in_qty, r.reserved_qty, r.incoming_qty, r.in_qty - r.reserved_qty])} />
+    <Table headers={["Item", "Warehouse", "In", "Reserved", "Incoming", "Available"]} rows={rows.map((r) => [r.item, r.warehouse, r.in_qty, r.reserved_qty, r.incoming_qty, r.available_qty])} />
   </>;
 }
 
