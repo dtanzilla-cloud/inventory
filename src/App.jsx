@@ -297,16 +297,54 @@ const masterDataConfig = {
   Suppliers: { table: "suppliers", activityField: "supplier", hasSku: false },
 };
 
-function parseCsvNames(text, hasSku = false) {
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const [firstLine] = lines;
-  const hasHeader = firstLine?.toLowerCase().includes("name");
-  const dataLines = hasHeader ? lines.slice(1) : lines;
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let quoted = false;
 
-  return dataLines.map((line) => {
-    const [name, sku] = line.split(",").map((value) => value?.trim() || "");
-    return hasSku ? { name, sku, active: true } : { name, active: true };
-  }).filter((row) => row.name);
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const nextChar = line[index + 1];
+
+    if (char === '"' && quoted && nextChar === '"') {
+      current += '"';
+      index += 1;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      values.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current.trim());
+  return values;
+}
+
+function parseCsvNames(text, hasSku = false) {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const [firstLine] = lines;
+  const firstValues = parseCsvLine(firstLine || "").map((value) => value.toLowerCase());
+  const hasHeader = firstValues.includes("name") || firstValues.includes("sku");
+  const nameIndex = hasHeader ? Math.max(firstValues.indexOf("name"), 0) : 0;
+  const skuIndex = hasHeader ? firstValues.indexOf("sku") : 1;
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+  const seenNames = new Set();
+
+  return dataLines.reduce((rows, line) => {
+    const values = parseCsvLine(line);
+    const name = (values[nameIndex] || "").trim();
+    const sku = (values[skuIndex] || "").trim();
+    const normalizedName = name.toLowerCase();
+
+    if (!name || seenNames.has(normalizedName)) return rows;
+
+    seenNames.add(normalizedName);
+    rows.push(hasSku ? { name, sku: sku || null, active: true } : { name, active: true });
+    return rows;
+  }, []);
 }
 
 function optionNames(records, rawValue) {
@@ -340,6 +378,7 @@ export default function InventoryManagementSystem() {
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
   const [inventorySort, setInventorySort] = useState({ key: "item", direction: "asc" });
+  const [successMessage, setSuccessMessage] = useState("");
   const isOwner = profile?.role === "owner" || profile?.role === "admin";
   const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
   const assignedWarehouse = warehouses.find((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
@@ -392,6 +431,7 @@ export default function InventoryManagementSystem() {
 
   async function loadProfile(user) {
     setErrorMessage("");
+    setSuccessMessage("");
 
     const { data, error } = await supabase
       .from("profiles")
@@ -486,6 +526,7 @@ export default function InventoryManagementSystem() {
 
     setLoading(true);
     setErrorMessage("");
+    setSuccessMessage("");
 
     let activityQuery = supabase
       .from("activities")
@@ -683,7 +724,7 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Insert failed in Supabase.");
+      setErrorMessage(`Insert failed in Supabase: ${error.message}`);
       return;
     }
 
@@ -699,11 +740,19 @@ export default function InventoryManagementSystem() {
       ? { warehouse_id: selectedWarehouse?.id || null, warehouse: selectedWarehouse?.name || "" }
       : { [field]: numberFields.includes(field) ? Number(value || 0) : value };
 
-    const { error } = await supabase.from("activities").update(payload).eq("id", activityId);
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    const { data, error } = await supabase
+      .from("activities")
+      .update(payload)
+      .eq("id", activityId)
+      .select("*, warehouses:warehouse_id(id, code, name)")
+      .single();
 
     if (error) {
       console.error(error);
-      setErrorMessage("Activity update failed.");
+      setErrorMessage(`Activity update failed: ${error.message}`);
       await loadActivities();
       return;
     }
@@ -711,10 +760,11 @@ export default function InventoryManagementSystem() {
     setActivities((current) =>
       current.map((activity) =>
         activity.id === activityId
-          ? normalizeActivity({ ...activity, ...payload, warehouses: field === "warehouse_id" ? selectedWarehouse : activity.warehouses })
+          ? { ...normalizeActivity(data), documents: activity.documents }
           : activity,
       ),
     );
+    setSuccessMessage("Activity saved.");
 
     if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) {
       await loadInventoryLedger();
@@ -728,7 +778,7 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Delete failed in Supabase.");
+      setErrorMessage(`Delete failed in Supabase: ${error.message}`);
       return;
     }
 
@@ -863,6 +913,8 @@ export default function InventoryManagementSystem() {
 
   async function saveMasterRecord(kind, record) {
     const config = masterDataConfig[kind];
+    setErrorMessage("");
+    setSuccessMessage("");
     const payload = config.hasSku
       ? { name: record.name, sku: record.sku || null, active: record.active !== false }
       : { name: record.name, active: record.active !== false };
@@ -874,11 +926,12 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage(`${kind} could not be saved.`);
+      setErrorMessage(`${kind} could not be saved: ${error.message}`);
       return;
     }
 
     await loadMasterData();
+    setSuccessMessage(`${kind} saved.`);
   }
 
   async function deleteMasterRecord(kind, record) {
@@ -915,19 +968,46 @@ export default function InventoryManagementSystem() {
     if (!file) return;
 
     const config = masterDataConfig[kind];
+    setErrorMessage("");
+    setSuccessMessage("");
+
     const text = await file.text();
     const rows = parseCsvNames(text, config.hasSku);
-    if (rows.length === 0) return;
 
-    const { error } = await supabase.from(config.table).insert(rows);
+    if (rows.length === 0) {
+      setErrorMessage(`No valid ${kind.toLowerCase()} found in CSV.`);
+      return;
+    }
+
+    const { data: existingRecords, error: existingError } = await supabase
+      .from(config.table)
+      .select("name");
+
+    if (existingError) {
+      console.error(existingError);
+      setErrorMessage(`${kind} import failed: ${existingError.message}`);
+      return;
+    }
+
+    const existingNames = new Set((existingRecords || []).map((record) => record.name?.trim().toLowerCase()).filter(Boolean));
+    const rowsToInsert = rows.filter((row) => !existingNames.has(row.name.toLowerCase()));
+    const skippedCount = rows.length - rowsToInsert.length;
+
+    if (rowsToInsert.length === 0) {
+      setSuccessMessage(`Imported 0 ${kind.toLowerCase()}; skipped ${skippedCount} existing.`);
+      return;
+    }
+
+    const { error } = await supabase.from(config.table).insert(rowsToInsert);
 
     if (error) {
       console.error(error);
-      setErrorMessage(`${kind} CSV import failed.`);
+      setErrorMessage(`${kind} CSV import failed: ${error.message}`);
       return;
     }
 
     await loadMasterData();
+    setSuccessMessage(`Imported ${rowsToInsert.length} ${kind.toLowerCase()}${skippedCount ? `; skipped ${skippedCount} existing` : ""}.`);
   }
 
   async function saveWarehouse(warehouseRecord) {
@@ -1001,6 +1081,7 @@ export default function InventoryManagementSystem() {
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
+            {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
             {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
@@ -1320,7 +1401,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
         <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add</Button></div>
         <label className="inline-flex cursor-pointer items-end justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium transition hover:bg-slate-100">
           <Upload size={16} className="mr-2" />Import CSV
-          <input type="file" accept=".csv,text/csv" className="hidden" onChange={(event) => onImport(kind, event.target.files)} />
+          <input type="file" accept=".csv,text/csv" className="hidden" onChange={async (event) => { await onImport(kind, event.target.files); event.target.value = ""; }} />
         </label>
       </div>
     </CardContent></Card>
