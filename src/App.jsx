@@ -12,10 +12,12 @@ import {
   Warehouse,
   Activity,
   DollarSign,
+  Save,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
-const warehouses = ["All", "Warehouse A"];
+const ALL_WAREHOUSES = "All";
+const DEFAULT_WAREHOUSE = { id: null, code: "WH-A", name: "Warehouse A", active: true };
 const DOCUMENT_BUCKET = "activity-documents";
 const CHARGE_INVOICE_BUCKET = "charge-invoices";
 const DEFAULT_CHARGE_MONTH = "December 2025";
@@ -59,19 +61,57 @@ function signedActivityUnits(activity) {
   return Number(activity.pieces) < 0 ? -Math.abs(pallets) : Math.abs(pallets);
 }
 
-function inventoryKey(item, warehouse) {
-  return `${item || ""}::${warehouse || ""}`;
+function warehouseName(warehouse) {
+  return warehouse?.name || warehouse?.warehouse || "";
+}
+
+function warehouseLabel(warehouse) {
+  if (!warehouse) return "";
+  return warehouse.code ? `${warehouse.name} (${warehouse.code})` : warehouse.name;
+}
+
+function normalizeWarehouse(warehouse) {
+  return {
+    id: warehouse.id,
+    code: warehouse.code || "",
+    name: warehouse.name || "",
+    active: warehouse.active !== false,
+    created_at: warehouse.created_at,
+  };
+}
+
+function normalizeProfile(profile) {
+  return {
+    ...profile,
+    role: profile?.role || "warehouse",
+    warehouse_id: profile?.warehouse_id || "",
+    warehouse_name: profile?.warehouses?.name || profile?.warehouse || "",
+    warehouse_code: profile?.warehouses?.code || "",
+  };
+}
+
+function getActivityWarehouseName(activity) {
+  return activity.warehouse_name || activity.warehouses?.name || activity.warehouse || "Unassigned";
+}
+
+function getActivityWarehouseKey(activity) {
+  return activity.warehouse_id || getActivityWarehouseName(activity);
+}
+
+function inventoryKey(item, warehouseKey) {
+  return `${item || ""}::${warehouseKey || ""}`;
 }
 
 function derivePalletBalances(activities) {
   const today = new Date().toISOString().slice(0, 10);
 
   return activities.reduce((balances, activity) => {
-    if (!activity.product || !activity.warehouse || !activity.activity_date || activity.activity_date >= today) {
+    const activityWarehouseKey = getActivityWarehouseKey(activity);
+    if (!activity.product || !activityWarehouseKey || !activity.activity_date || activity.activity_date >= today) {
       return balances;
     }
 
-    const key = inventoryKey(activity.product, activity.warehouse);
+    const key = inventoryKey(activity.product, activityWarehouseKey);
     balances.set(key, (balances.get(key) || 0) + signedActivityUnits(activity));
     return balances;
   }, new Map());
@@ -101,6 +141,10 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
   }
 
   return rows;
+}
+
+function rowMatchesWarehouse(row, warehouseFilter) {
+  return warehouseFilter === ALL_WAREHOUSES || row.warehouse_id === warehouseFilter || row.warehouse === warehouseFilter;
 }
 
 function calculateCharges(monthKey, activities, rates, invoices) {
@@ -148,6 +192,9 @@ function normalizeActivity(activity) {
     ...activity,
     activity_date: activity.activity_date || activity.date || "",
     documents: Array.isArray(activity.documents) ? activity.documents : [],
+    warehouse_id: activity.warehouse_id || "",
+    warehouse_name: activity.warehouses?.name || activity.warehouse || "",
+    warehouse_code: activity.warehouses?.code || "",
   };
 }
 
@@ -183,7 +230,8 @@ export default function InventoryManagementSystem() {
   const [profile, setProfile] = useState(null);
   const [profiles, setProfiles] = useState([]);
   const [section, setSection] = useState("Activities");
-  const [warehouse, setWarehouse] = useState("All");
+  const [warehouse, setWarehouse] = useState(ALL_WAREHOUSES);
+  const [warehouses, setWarehouses] = useState([DEFAULT_WAREHOUSE]);
   const [activities, setActivities] = useState([]);
   const [inventoryLedger, setInventoryLedger] = useState([]);
   const [products, setProducts] = useState([]);
@@ -201,6 +249,11 @@ export default function InventoryManagementSystem() {
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
+  const isOwner = profile?.role === "owner" || profile?.role === "admin";
+  const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
+  const assignedWarehouse = warehouses.find((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
+  const selectableWarehouses = isOwner ? activeWarehouses : activeWarehouses.filter((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
+  const defaultWarehouse = assignedWarehouse || activeWarehouses[0] || warehouses[0] || DEFAULT_WAREHOUSE;
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -218,6 +271,7 @@ export default function InventoryManagementSystem() {
         setCustomers([]);
         setSuppliers([]);
         setProfiles([]);
+        setWarehouses([DEFAULT_WAREHOUSE]);
         setBillingRates({});
         setChargeInvoices({});
       }
@@ -235,8 +289,9 @@ export default function InventoryManagementSystem() {
   useEffect(() => {
     if (!profile) return;
     loadActivities(profile);
+    loadWarehouses(profile);
     loadMasterData();
-    if (profile.role === "owner") {
+    if (isOwner) {
       loadProfiles();
       loadCharges();
     }
@@ -249,7 +304,7 @@ export default function InventoryManagementSystem() {
 
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse")
+      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
       .eq("id", user.id)
       .single();
 
@@ -260,25 +315,56 @@ export default function InventoryManagementSystem() {
       return;
     }
 
-    if (data.role === "warehouse") {
-      setWarehouse(data.warehouse);
-      if (section === "Charges" || section === "Settings") setSection("Activities");
+    const nextProfile = normalizeProfile(data);
+
+    if (nextProfile.role === "warehouse") {
+      setWarehouse(nextProfile.warehouse_id || nextProfile.warehouse_name);
+      if (["Charges", "Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
     }
 
-    setProfile(data);
+    setProfile(nextProfile);
   }
 
   async function loadProfiles() {
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse")
+      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
       .order("email", { ascending: true });
 
     if (error) {
       console.error(error);
       setErrorMessage("Settings loaded, but user profiles could not be loaded.");
     } else {
-      setProfiles(data || []);
+      setProfiles((data || []).map(normalizeProfile));
+    }
+  }
+
+  async function loadWarehouses(activeProfile = profile) {
+    let warehouseQuery = supabase
+      .from("warehouses")
+      .select("id, code, name, active, created_at")
+      .order("name", { ascending: true });
+
+    if (activeProfile?.role === "warehouse" && activeProfile.warehouse_id) {
+      warehouseQuery = warehouseQuery.eq("id", activeProfile.warehouse_id);
+    }
+
+    const { data, error } = await warehouseQuery;
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("Warehouses could not be loaded.");
+      setWarehouses([DEFAULT_WAREHOUSE]);
+      return;
+    }
+
+    const nextWarehouses = (data || []).map(normalizeWarehouse);
+    const safeWarehouses = nextWarehouses.length ? nextWarehouses : [DEFAULT_WAREHOUSE];
+    setWarehouses(safeWarehouses);
+
+    if (activeProfile?.role === "warehouse") {
+      const selectedWarehouse = safeWarehouses.find((warehouseRecord) => warehouseRecord.id === activeProfile.warehouse_id);
+      setWarehouse(selectedWarehouse?.id || activeProfile.warehouse_name || activeProfile.warehouse || DEFAULT_WAREHOUSE.name);
     }
   }
 
@@ -308,11 +394,15 @@ export default function InventoryManagementSystem() {
 
     let activityQuery = supabase
       .from("activities")
-      .select("*")
+      .select("*, warehouses:warehouse_id(id, code, name)")
       .order("activity_date", { ascending: false });
 
     if (activeProfile.role === "warehouse") {
-      activityQuery = activityQuery.eq("warehouse", activeProfile.warehouse);
+      if (activeProfile.warehouse_id) {
+        activityQuery = activityQuery.eq("warehouse_id", activeProfile.warehouse_id);
+      } else {
+        activityQuery = activityQuery.eq("warehouse", activeProfile.warehouse_name || activeProfile.warehouse);
+      }
     }
 
     const { data, error } = await activityQuery;
@@ -368,7 +458,11 @@ export default function InventoryManagementSystem() {
       .order("item", { ascending: true });
 
     if (activeProfile.role === "warehouse") {
-      ledgerQuery = ledgerQuery.eq("warehouse", activeProfile.warehouse);
+      if (activeProfile.warehouse_id) {
+        ledgerQuery = ledgerQuery.eq("warehouse_id", activeProfile.warehouse_id);
+      } else {
+        ledgerQuery = ledgerQuery.eq("warehouse", activeProfile.warehouse_name || activeProfile.warehouse);
+      }
     }
 
     const { data, error } = await ledgerQuery;
@@ -424,7 +518,7 @@ export default function InventoryManagementSystem() {
 
   const visibleActivities = activities.filter(
     (a) =>
-      (warehouse === "All" || a.warehouse === warehouse) &&
+      rowMatchesWarehouse(a, warehouse) &&
       JSON.stringify(a).toLowerCase().includes(query.toLowerCase()),
   );
   const sortedActivities = useMemo(() => {
@@ -442,10 +536,10 @@ export default function InventoryManagementSystem() {
   const palletBalances = useMemo(() => derivePalletBalances(activities), [activities]);
   const visibleInventory = useMemo(
     () => inventoryLedger
-      .filter((i) => warehouse === "All" || i.warehouse === warehouse)
+      .filter((i) => rowMatchesWarehouse(i, warehouse))
       .map((row) => ({
         ...row,
-        pallets: palletBalances.get(inventoryKey(row.item, row.warehouse)) || 0,
+        pallets: palletBalances.get(inventoryKey(row.item, row.warehouse_id || row.warehouse)) || 0,
       })),
     [inventoryLedger, palletBalances, warehouse],
   );
@@ -467,10 +561,14 @@ export default function InventoryManagementSystem() {
 
   async function addEvent() {
     if (!profile) return;
-    const defaultWarehouse = profile.role === "warehouse" ? profile.warehouse : warehouse === "All" ? "Warehouse A" : warehouse;
+    const selectedWarehouse =
+      profile.role === "warehouse"
+        ? assignedWarehouse || defaultWarehouse
+        : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse) || defaultWarehouse;
     const payload = {
       activity_date: new Date().toISOString().slice(0, 10),
-      warehouse: defaultWarehouse,
+      warehouse_id: selectedWarehouse.id || null,
+      warehouse: warehouseName(selectedWarehouse),
       pallets: 0,
       pieces: 0,
       product: "",
@@ -496,9 +594,10 @@ export default function InventoryManagementSystem() {
 
   async function updateActivity(activityId, field, value) {
     const numberFields = ["pallets", "pieces"];
-    const payload = {
-      [field]: numberFields.includes(field) ? Number(value || 0) : value,
-    };
+    const selectedWarehouse = field === "warehouse_id" ? warehouses.find((warehouseRecord) => warehouseRecord.id === value) : null;
+    const payload = field === "warehouse_id"
+      ? { warehouse_id: selectedWarehouse?.id || null, warehouse: selectedWarehouse?.name || "" }
+      : { [field]: numberFields.includes(field) ? Number(value || 0) : value };
 
     const { error } = await supabase.from("activities").update(payload).eq("id", activityId);
 
@@ -513,7 +612,7 @@ export default function InventoryManagementSystem() {
       current.map((activity) => activity.id === activityId ? { ...activity, ...payload } : activity),
     );
 
-    if (["activity_date", "warehouse", "pallets", "pieces", "product"].includes(field)) {
+    if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) {
       await loadInventoryLedger();
     }
   }
@@ -542,6 +641,7 @@ export default function InventoryManagementSystem() {
 
     try {
       const uploadedDocuments = [];
+      const activity = activities.find((currentActivity) => currentActivity.id === activityId);
 
       for (const file of files) {
         const storagePath = `${activityId}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
@@ -558,6 +658,7 @@ export default function InventoryManagementSystem() {
 
         const documentPayload = {
           activity_id: activityId,
+          warehouse_id: activity?.warehouse_id || null,
           file_name: file.name,
           file_url: publicUrlData.publicUrl,
         };
@@ -725,6 +826,33 @@ export default function InventoryManagementSystem() {
     await loadMasterData();
   }
 
+  async function saveWarehouse(warehouseRecord) {
+    const code = warehouseRecord.code.trim().toUpperCase();
+    const name = warehouseRecord.name.trim();
+
+    if (!code || !name) {
+      setErrorMessage("Warehouse code and name are required.");
+      return;
+    }
+
+    const payload = { code, name, active: warehouseRecord.active !== false };
+    const request = warehouseRecord.id
+      ? supabase.from("warehouses").update(payload).eq("id", warehouseRecord.id)
+      : supabase.from("warehouses").insert([payload]);
+
+    const { error } = await request;
+
+    if (error) {
+      console.error(error);
+      setErrorMessage("Warehouse could not be saved.");
+      return;
+    }
+
+    await loadWarehouses(profile);
+    await loadActivities(profile);
+    await loadInventoryLedger(profile);
+  }
+
   if (authLoading) {
     return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">Loading...</div>;
   }
@@ -746,14 +874,16 @@ export default function InventoryManagementSystem() {
           <NavButton icon={<Activity size={18} />} active={section === "Activities"} onClick={() => setSection("Activities")}>Activities</NavButton>
 
           <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Inventory</div>
-          {(profile.role === "owner" ? warehouses : [profile.warehouse]).map((w) => <NavButton key={w} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === w} onClick={() => { setSection("Inventory"); setWarehouse(w); }}>{w}</NavButton>)}
+          {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => { setSection("Inventory"); setWarehouse(ALL_WAREHOUSES); }}>All warehouses</NavButton>}
+          {selectableWarehouses.map((warehouseRecord) => <NavButton key={warehouseRecord.id || warehouseRecord.code} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === warehouseRecord.id} onClick={() => { setSection("Inventory"); setWarehouse(warehouseRecord.id); }}>{warehouseRecord.name}</NavButton>)}
 
-          {profile.role === "owner" && <>
+          {isOwner && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
             <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
 
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
             <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
+            <NavButton icon={<Warehouse size={18} />} active={section === "Warehouses"} onClick={() => setSection("Warehouses")}>Warehouses</NavButton>
             <NavButton icon={<Settings size={18} />} active={section === "Products"} onClick={() => setSection("Products")}>Products</NavButton>
             <NavButton icon={<Settings size={18} />} active={section === "Customers"} onClick={() => setSection("Customers")}>Customers</NavButton>
             <NavButton icon={<Settings size={18} />} active={section === "Suppliers"} onClick={() => setSection("Suppliers")}>Suppliers</NavButton>
@@ -767,13 +897,14 @@ export default function InventoryManagementSystem() {
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers }} />}
-            {section === "Inventory" && <InventoryView warehouse={warehouse} rows={visibleInventory} />}
-            {section === "Charges" && profile.role === "owner" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
-            {section === "Settings" && profile.role === "owner" && <SettingsView profiles={profiles} />}
-            {section === "Products" && profile.role === "owner" && <MasterDataView kind="Products" records={products} hasSku onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
-            {section === "Customers" && profile.role === "owner" && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
-            {section === "Suppliers" && profile.role === "owner" && <MasterDataView kind="Suppliers" records={suppliers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
+            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner }} />}
+            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse)?.name || warehouse} rows={visibleInventory} />}
+            {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
+            {section === "Settings" && isOwner && <SettingsView profiles={profiles} />}
+            {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
+            {section === "Products" && isOwner && <MasterDataView kind="Products" records={products} hasSku onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
+            {section === "Customers" && isOwner && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
+            {section === "Suppliers" && isOwner && <MasterDataView kind="Suppliers" records={suppliers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
           </motion.div>
         </main>
       </div>
@@ -827,9 +958,10 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers }) {
+function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner }) {
   const columns = [
     ["activity_date", "Date"],
+    ["warehouse", "Warehouse"],
     ["pallets", "Pallet"],
     ["pieces", "Pieces"],
     ["product", "Product"],
@@ -841,7 +973,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
     ["docs", "Docs"],
     ["delete", "Delete"],
   ];
-  const sortable = new Set(["activity_date", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "repack"]);
+  const sortable = new Set(["activity_date", "warehouse", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "repack"]);
 
   function toggleSort(key) {
     if (!sortable.has(key)) return;
@@ -878,6 +1010,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" disabled={!isOwner} value={activity.warehouse_id || ""} displayValue={getActivityWarehouseName(activity)} options={warehouses.map((warehouseRecord) => ({ value: warehouseRecord.id, label: warehouseLabel(warehouseRecord) }))} onSave={(value) => updateActivity(activity.id, "warehouse_id", value)} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} onSave={(value) => updateActivity(activity.id, "product", value)} /></td>
@@ -897,7 +1030,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
   </>;
 }
 
-function EditableCell({ value = "", type = "text", options = [], onSave }) {
+function EditableCell({ value = "", displayValue, type = "text", options = [], disabled = false, onSave }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value ?? "");
 
@@ -912,14 +1045,18 @@ function EditableCell({ value = "", type = "text", options = [], onSave }) {
   }
 
   if (!editing) {
-    return <button className="min-h-6 w-full text-left" onClick={() => setEditing(true)}>{value || "-"}</button>;
+    return <button className="min-h-6 w-full text-left disabled:cursor-not-allowed" disabled={disabled} onClick={() => setEditing(true)}>{displayValue || value || "-"}</button>;
   }
 
   if (type === "select") {
     return (
       <select className="w-full rounded border px-2 py-1" autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}>
         <option value=""></option>
-        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+        {options.map((option) => {
+          const optionValue = typeof option === "object" ? option.value : option;
+          const optionLabel = typeof option === "object" ? option.label : option;
+          return <option key={optionValue} value={optionValue}>{optionLabel}</option>;
+        })}
       </select>
     );
   }
@@ -1066,10 +1203,66 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
   </>;
 }
 
+function WarehouseSettings({ warehouses, saveWarehouse }) {
+  const [newWarehouse, setNewWarehouse] = useState({ code: "", name: "", active: true });
+  const [editingRows, setEditingRows] = useState({});
+
+  function updateRow(warehouseRecord, patch) {
+    setEditingRows((current) => ({
+      ...current,
+      [warehouseRecord.id]: { ...warehouseRecord, ...(current[warehouseRecord.id] || {}), ...patch },
+    }));
+  }
+
+  async function saveNew() {
+    if (!newWarehouse.code || !newWarehouse.name) return;
+    await saveWarehouse(newWarehouse);
+    setNewWarehouse({ code: "", name: "", active: true });
+  }
+
+  return <>
+    <Header title="Settings - Warehouses" subtitle="Owner-managed warehouse codes, names, and active status." />
+    <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
+      <div className="grid grid-cols-4 gap-3">
+        <Input label="Code" value={newWarehouse.code} onChange={(value) => setNewWarehouse({ ...newWarehouse, code: value })} />
+        <Input label="Name" value={newWarehouse.name} onChange={(value) => setNewWarehouse({ ...newWarehouse, name: value })} />
+        <Select label="Active" value={newWarehouse.active ? "true" : "false"} onChange={(value) => setNewWarehouse({ ...newWarehouse, active: value === "true" })} options={["true", "false"]} />
+        <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add warehouse</Button></div>
+      </div>
+    </CardContent></Card>
+
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-100 text-slate-600">
+          <tr>
+            <th className="text-left px-4 py-3 font-semibold">Code</th>
+            <th className="text-left px-4 py-3 font-semibold">Name</th>
+            <th className="text-left px-4 py-3 font-semibold">Active</th>
+            <th className="text-left px-4 py-3 font-semibold">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {warehouses.map((warehouseRecord) => {
+            const draft = editingRows[warehouseRecord.id] || warehouseRecord;
+            return (
+              <tr key={warehouseRecord.id || warehouseRecord.code} className="border-t hover:bg-slate-50">
+                <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.code || ""} onChange={(event) => updateRow(warehouseRecord, { code: event.target.value })} /></td>
+                <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.name || ""} onChange={(event) => updateRow(warehouseRecord, { name: event.target.value })} /></td>
+                <td className="px-4 py-3"><select className="rounded border px-2 py-1" value={draft.active === false ? "false" : "true"} onChange={(event) => updateRow(warehouseRecord, { active: event.target.value === "true" })}><option value="true">Active</option><option value="false">Inactive</option></select></td>
+                <td className="px-4 py-3"><Button size="sm" onClick={() => saveWarehouse(draft)}><Save size={14} className="mr-2" />Save</Button></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  </>;
+}
+
 function SettingsView({ profiles }) {
   return <>
     <Header title="Settings - Users" subtitle="Owner and warehouse-level user access." />
-    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={profiles.map((user) => [user.email, user.role, user.role === "owner" ? "All warehouses + charges + settings" : `${user.warehouse} activities and inventory only`])} /></CardContent></Card>
+    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={profiles.map((user) => [user.email, user.role, user.role === "owner" ? "All warehouses + charges + settings" : `${user.warehouse_name || user.warehouse} activities and inventory only`])} /></CardContent></Card>
   </>;
 }
 
