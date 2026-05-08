@@ -82,6 +82,7 @@ function normalizeProfile(profile) {
     warehouse_id: profile?.warehouse_id || "",
     warehouse_name: profile?.warehouses?.name || profile?.warehouse || "",
     warehouse_code: profile?.warehouses?.code || "",
+    active: profile?.active !== false,
   };
 }
 
@@ -276,6 +277,10 @@ function calculateCharges(monthKey, activities, rates, invoices) {
   };
 }
 
+function filterRowsByWarehouse(rows, warehouseFilter, warehouseRecords = []) {
+  return rows.filter((row) => rowMatchesWarehouse(row, warehouseFilter, warehouseRecords));
+}
+
 function normalizeActivity(activity) {
   return {
     ...activity,
@@ -359,6 +364,7 @@ export default function InventoryManagementSystem() {
   const [section, setSection] = useState("Activities");
   const [warehouse, setWarehouse] = useState(ALL_WAREHOUSES);
   const [activityWarehouse, setActivityWarehouse] = useState(ALL_WAREHOUSES);
+  const [chargesWarehouse, setChargesWarehouse] = useState(ALL_WAREHOUSES);
   const [warehouses, setWarehouses] = useState([DEFAULT_WAREHOUSE]);
   const [activities, setActivities] = useState([]);
   const [inventoryLedger, setInventoryLedger] = useState([]);
@@ -421,9 +427,9 @@ export default function InventoryManagementSystem() {
     loadActivities(profile);
     loadWarehouses(profile);
     loadMasterData();
+    loadCharges();
     if (isOwner) {
       loadProfiles();
-      loadCharges();
     }
     loadInventoryLedger(profile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -435,7 +441,7 @@ export default function InventoryManagementSystem() {
 
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
+      .select("id, email, role, warehouse, warehouse_id, active, warehouses:warehouse_id(id, code, name)")
       .eq("id", user.id)
       .single();
 
@@ -448,11 +454,18 @@ export default function InventoryManagementSystem() {
 
     const nextProfile = normalizeProfile(data);
 
+    if (!nextProfile.active) {
+      setErrorMessage("This profile is inactive. Contact an owner to restore access.");
+      setProfile(null);
+      return;
+    }
+
     if (nextProfile.role === "warehouse") {
       const assignedWarehouseFilter = nextProfile.warehouse_id || nextProfile.warehouse_name;
       setWarehouse(assignedWarehouseFilter);
       setActivityWarehouse(assignedWarehouseFilter);
-      if (["Charges", "Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
+      setChargesWarehouse(assignedWarehouseFilter);
+      if (["Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
     }
 
     setProfile(nextProfile);
@@ -461,7 +474,7 @@ export default function InventoryManagementSystem() {
   async function loadProfiles() {
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
+      .select("id, email, role, warehouse, warehouse_id, active, warehouses:warehouse_id(id, code, name)")
       .order("email", { ascending: true });
 
     if (error) {
@@ -500,6 +513,7 @@ export default function InventoryManagementSystem() {
       const assignedWarehouseFilter = selectedWarehouse?.id || activeProfile.warehouse_name || activeProfile.warehouse || DEFAULT_WAREHOUSE.name;
       setWarehouse(assignedWarehouseFilter);
       setActivityWarehouse(assignedWarehouseFilter);
+      setChargesWarehouse(assignedWarehouseFilter);
     }
   }
 
@@ -618,7 +632,7 @@ export default function InventoryManagementSystem() {
 
     const [ratesResult, invoicesResult, summariesResult] = await Promise.all([
       supabase.from("billing_rates").select("month, storage_rate, inbound_rate, outbound_rate").order("month", { ascending: false }),
-      supabase.from("charge_invoices").select("id, month, file_name, file_url, status").order("created_at", { ascending: false }),
+      supabase.from("charge_invoices").select("id, month, warehouse_id, file_name, file_url, status, warehouses:warehouse_id(id, code, name)").order("created_at", { ascending: false }),
       supabase.from("monthly_charge_summaries").select("*").order("month", { ascending: false }),
     ]);
 
@@ -633,7 +647,11 @@ export default function InventoryManagementSystem() {
       acc[rate.month] = rate;
       return acc;
     }, {});
-    const nextInvoices = (invoicesResult.data || []).reduce((acc, invoice) => {
+    const nextInvoices = (invoicesResult.data || []).map((invoice) => ({
+      ...invoice,
+      warehouse_name: invoice.warehouses?.name || "",
+      warehouse_code: invoice.warehouses?.code || "",
+    })).reduce((acc, invoice) => {
       acc[invoice.month] = [...(acc[invoice.month] || []), invoice];
       return acc;
     }, {});
@@ -693,11 +711,19 @@ export default function InventoryManagementSystem() {
   );
   const selectedChargeMonth = month || visibleChargeMonths[0] || DEFAULT_CHARGE_MONTH;
   const chargeMonthKey = monthKeyFromLabel(selectedChargeMonth);
+  const chargeActivities = useMemo(
+    () => filterRowsByWarehouse(activities, chargesWarehouse, warehouses),
+    [activities, chargesWarehouse, warehouses],
+  );
+  const visibleChargeInvoices = useMemo(
+    () => filterRowsByWarehouse(chargeInvoices[chargeMonthKey] || [], chargesWarehouse, warehouses),
+    [chargeInvoices, chargeMonthKey, chargesWarehouse, warehouses],
+  );
   const charges = calculateCharges(
     chargeMonthKey,
-    activities,
+    chargeActivities,
     billingRates[chargeMonthKey],
-    chargeInvoices[chargeMonthKey] || [],
+    visibleChargeInvoices,
   );
 
   async function addEvent() {
@@ -871,6 +897,8 @@ export default function InventoryManagementSystem() {
     if (files.length === 0) return;
 
     const targetMonth = monthKeyFromLabel(monthLabel);
+    const selectedWarehouse = warehouseRecordForFilter(chargesWarehouse, warehouses);
+    const invoiceScope = selectedWarehouse?.id || ALL_WAREHOUSES.toLowerCase();
     setUploadingInvoice(true);
     setErrorMessage("");
 
@@ -878,7 +906,7 @@ export default function InventoryManagementSystem() {
       const uploadedInvoices = [];
 
       for (const file of files) {
-        const storagePath = `${targetMonth}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
+        const storagePath = `${invoiceScope}/${targetMonth}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
         const { error: uploadError } = await supabase.storage
           .from(CHARGE_INVOICE_BUCKET)
           .upload(storagePath, file, { upsert: false, contentType: file.type || "application/pdf" });
@@ -891,12 +919,16 @@ export default function InventoryManagementSystem() {
 
         const { data: invoice, error: invoiceError } = await supabase
           .from("charge_invoices")
-          .insert([{ month: targetMonth, file_name: file.name, file_url: publicUrlData.publicUrl, status: "PAID" }])
-          .select("id, month, file_name, file_url, status")
+          .insert([{ month: targetMonth, warehouse_id: selectedWarehouse?.id || null, file_name: file.name, file_url: publicUrlData.publicUrl, status: "PAID" }])
+          .select("id, month, warehouse_id, file_name, file_url, status, warehouses:warehouse_id(id, code, name)")
           .single();
 
         if (invoiceError) throw invoiceError;
-        uploadedInvoices.push(invoice);
+        uploadedInvoices.push({
+          ...invoice,
+          warehouse_name: invoice.warehouses?.name || selectedWarehouse?.name || null,
+          warehouse_code: invoice.warehouses?.code || selectedWarehouse?.code || null,
+        });
       }
 
       setChargeInvoices((current) => ({
@@ -905,7 +937,7 @@ export default function InventoryManagementSystem() {
       }));
     } catch (error) {
       console.error(error);
-      setErrorMessage("Invoice upload failed. Please try again.");
+      setErrorMessage(`Invoice upload failed: ${error.message || "Please try again."}`);
     } finally {
       setUploadingInvoice(false);
     }
@@ -1037,6 +1069,70 @@ export default function InventoryManagementSystem() {
     await loadInventoryLedger(profile);
   }
 
+  async function saveProfile(profileRecord) {
+    const email = profileRecord.email?.trim().toLowerCase();
+    const role = profileRecord.role || "warehouse";
+    const selectedWarehouse = warehouseRecordForFilter(profileRecord.warehouse_id, warehouses);
+
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    if (!email) {
+      setErrorMessage("User email is required.");
+      return;
+    }
+
+    if (role === "warehouse" && !selectedWarehouse?.id) {
+      setErrorMessage("Warehouse users must be assigned to an active warehouse.");
+      return;
+    }
+
+    const { data: existingProfiles, error: findError } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .eq("email", email)
+      .limit(1);
+
+    if (findError) {
+      console.error(findError);
+      setErrorMessage(`User lookup failed: ${findError.message}`);
+      return;
+    }
+
+    const existingProfile = profileRecord.id ? profileRecord : existingProfiles?.[0];
+
+    if (!existingProfile?.id) {
+      setErrorMessage(`No Supabase Auth user/profile exists for ${email}. Invite or create the Auth user first, then return here to assign role and warehouse.`);
+      return;
+    }
+
+    const payload = {
+      email,
+      role,
+      warehouse_id: role === "warehouse" ? selectedWarehouse.id : null,
+      warehouse: role === "warehouse" ? selectedWarehouse.name : null,
+      active: profileRecord.active !== false,
+    };
+
+    const { error } = await supabase
+      .from("profiles")
+      .update(payload)
+      .eq("id", existingProfile.id);
+
+    if (error) {
+      console.error(error);
+      setErrorMessage(`User profile could not be saved: ${error.message}`);
+      return;
+    }
+
+    await loadProfiles();
+    setSuccessMessage(`Profile saved for ${email}.`);
+  }
+
+  async function deactivateProfile(profileRecord) {
+    await saveProfile({ ...profileRecord, active: false });
+  }
+
   if (authLoading) {
     return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">Loading...</div>;
   }
@@ -1061,10 +1157,10 @@ export default function InventoryManagementSystem() {
           {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => { setSection("Inventory"); setWarehouse(ALL_WAREHOUSES); }}>All warehouses</NavButton>}
           {selectableWarehouses.map((warehouseRecord) => <NavButton key={warehouseRecord.id || warehouseRecord.code} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === warehouseRecord.id} onClick={() => { setSection("Inventory"); setWarehouse(warehouseRecord.id); }}>{warehouseRecord.name}</NavButton>)}
 
-          {isOwner && <>
-            <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-            <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
+          <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
+          <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
 
+          {isOwner && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
             <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
             <NavButton icon={<Warehouse size={18} />} active={section === "Warehouses"} onClick={() => setSection("Warehouses")}>Warehouses</NavButton>
@@ -1084,8 +1180,8 @@ export default function InventoryManagementSystem() {
             {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
-            {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
-            {section === "Settings" && isOwner && <SettingsView profiles={profiles} />}
+            {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
+            {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
             {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
             {section === "Products" && isOwner && <MasterDataView kind="Products" records={products} hasSku onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
             {section === "Customers" && isOwner && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
@@ -1308,7 +1404,7 @@ function InventoryView({ warehouse, rows, sort, setSort }) {
   </>;
 }
 
-function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices }) {
+function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices, warehouses, isOwner, chargesWarehouse, setChargesWarehouse }) {
   const [editingRates, setEditingRates] = useState(false);
   const [rateDraft, setRateDraft] = useState({
     storageRate: charges.storageRate,
@@ -1323,8 +1419,17 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
 
   return <>
     <Header title={`Charges - ${month}`} subtitle="Storage, inbound handling, outbound handling, invoices, and charge details." />
-    <div className="mb-4 max-w-xs">
+    <div className="mb-4 grid max-w-xl grid-cols-2 gap-3">
       <Select label="Month" value={month} onChange={setMonth} options={months} />
+      <Select
+        label="Warehouse"
+        value={chargesWarehouse}
+        onChange={setChargesWarehouse}
+        options={isOwner ? [{ id: ALL_WAREHOUSES, name: "All Warehouses" }, ...warehouses] : warehouses}
+        disabled={!isOwner}
+        getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+        getOptionValue={(warehouseRecord) => warehouseRecord.id}
+      />
     </div>
     {loading && <div className="mb-4 rounded-xl border bg-white px-4 py-3 text-sm text-slate-500">Loading charges...</div>}
     <div className="grid grid-cols-4 gap-4 mb-6"><KPI label="Storage" value={money(charges.storageSubtotal)} /><KPI label="Inbound" value={money(charges.inboundSubtotal)} /><KPI label="Outbound" value={money(charges.outboundSubtotal)} /><KPI label="Total" value={money(charges.total)} /></div>
@@ -1343,14 +1448,14 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
           <Rate label="Storage" value={`${money(charges.storageRate)} / unit / week`} />
           <Rate label="Inbound" value={`${money(charges.inboundRate)} / HU`} />
           <Rate label="Outbound" value={`${money(charges.outboundRate)} / HU`} />
-          <Button variant="outline" className="mt-4 rounded-xl" onClick={() => {
+          {isOwner && <Button variant="outline" className="mt-4 rounded-xl" onClick={() => {
             setRateDraft({
               storageRate: charges.storageRate,
               inboundRate: charges.inboundRate,
               outboundRate: charges.outboundRate,
             });
             setEditingRates(true);
-          }}>Edit rates</Button>
+          }}>Edit rates</Button>}
         </>}
       </CardContent></Card>
       <Card className="rounded-2xl shadow-sm col-span-2"><CardContent className="p-5">
@@ -1494,10 +1599,84 @@ function WarehouseSettings({ warehouses, saveWarehouse }) {
   </>;
 }
 
-function SettingsView({ profiles }) {
+function SettingsView({ profiles, warehouses, onSave, onDeactivate }) {
+  const [newProfile, setNewProfile] = useState({ email: "", role: "warehouse", warehouse_id: warehouses[0]?.id || "", active: true });
+  const [editingRows, setEditingRows] = useState({});
+
+  function updateRow(profileRecord, patch) {
+    setEditingRows((current) => ({
+      ...current,
+      [profileRecord.id]: { ...profileRecord, ...(current[profileRecord.id] || {}), ...patch },
+    }));
+  }
+
+  async function saveNewProfile() {
+    await onSave(newProfile);
+    setNewProfile({ email: "", role: "warehouse", warehouse_id: warehouses[0]?.id || "", active: true });
+  }
+
   return <>
-    <Header title="Settings - Users" subtitle="Owner and warehouse-level user access." />
-    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={profiles.map((user) => [user.email, user.role, user.role === "owner" ? "All warehouses + charges + settings" : `${user.warehouse_name || user.warehouse} activities and inventory only`])} /></CardContent></Card>
+    <Header title="Settings - Users" subtitle="Configure Auth-backed profiles. New emails must already exist in Supabase Auth or be invited before they can be assigned here." />
+    <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
+      <div className="grid grid-cols-[minmax(0,1.5fr)_160px_minmax(0,1fr)_120px_auto] gap-3">
+        <Input label="Email" type="email" value={newProfile.email} onChange={(value) => setNewProfile({ ...newProfile, email: value })} />
+        <Select label="Role" value={newProfile.role} onChange={(value) => setNewProfile({ ...newProfile, role: value })} options={["owner", "admin", "warehouse"]} />
+        <Select
+          label="Warehouse"
+          value={newProfile.warehouse_id}
+          onChange={(value) => setNewProfile({ ...newProfile, warehouse_id: value })}
+          options={warehouses}
+          disabled={newProfile.role !== "warehouse"}
+          getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+          getOptionValue={(warehouseRecord) => warehouseRecord.id}
+        />
+        <Select label="Active" value={newProfile.active ? "true" : "false"} onChange={(value) => setNewProfile({ ...newProfile, active: value === "true" })} options={["true", "false"]} />
+        <div className="flex items-end"><Button onClick={saveNewProfile}>Save user</Button></div>
+      </div>
+    </CardContent></Card>
+
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-100 text-slate-600">
+          <tr>
+            <th className="text-left px-4 py-3 font-semibold">Email</th>
+            <th className="text-left px-4 py-3 font-semibold">Role</th>
+            <th className="text-left px-4 py-3 font-semibold">Warehouse</th>
+            <th className="text-left px-4 py-3 font-semibold">Active</th>
+            <th className="text-left px-4 py-3 font-semibold">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {profiles.map((profileRecord) => {
+            const draft = editingRows[profileRecord.id] || profileRecord;
+            return (
+              <tr key={profileRecord.id} className="border-t hover:bg-slate-50">
+                <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.email || ""} onChange={(event) => updateRow(profileRecord, { email: event.target.value })} /></td>
+                <td className="px-4 py-3"><Select label="" value={draft.role || "warehouse"} onChange={(value) => updateRow(profileRecord, { role: value })} options={["owner", "admin", "warehouse"]} /></td>
+                <td className="px-4 py-3">
+                  <Select
+                    label=""
+                    value={draft.warehouse_id || ""}
+                    onChange={(value) => updateRow(profileRecord, { warehouse_id: value })}
+                    options={warehouses}
+                    disabled={draft.role !== "warehouse"}
+                    getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+                    getOptionValue={(warehouseRecord) => warehouseRecord.id}
+                  />
+                </td>
+                <td className="px-4 py-3"><Select label="" value={draft.active === false ? "false" : "true"} onChange={(value) => updateRow(profileRecord, { active: value === "true" })} options={["true", "false"]} /></td>
+                <td className="px-4 py-3">
+                  <div className="flex gap-2">
+                    <Button size="sm" onClick={() => onSave(draft)}>Save</Button>
+                    <Button size="sm" variant="ghost" onClick={() => onDeactivate(draft)}>Deactivate</Button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   </>;
 }
 
