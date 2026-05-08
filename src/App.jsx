@@ -102,19 +102,91 @@ function inventoryKey(item, warehouseKey) {
   return `${item || ""}::${warehouseKey || ""}`;
 }
 
+function warehouseAliases(row) {
+  return [
+    row?.warehouse_id,
+    row?.warehouse,
+    row?.warehouse_name,
+    row?.warehouse_code,
+    row?.warehouses?.id,
+    row?.warehouses?.name,
+    row?.warehouses?.code,
+  ].filter(Boolean);
+}
+
+function warehouseRecordForFilter(warehouseFilter, warehouseRecords) {
+  return warehouseRecords.find((warehouseRecord) =>
+    [warehouseRecord.id, warehouseRecord.name, warehouseRecord.code].filter(Boolean).includes(warehouseFilter),
+  );
+}
+
+function rowMatchesWarehouse(row, warehouseFilter, warehouseRecords = []) {
+  if (warehouseFilter === ALL_WAREHOUSES) return true;
+
+  const selectedWarehouse = warehouseRecordForFilter(warehouseFilter, warehouseRecords);
+  const selectedAliases = selectedWarehouse
+    ? [selectedWarehouse.id, selectedWarehouse.name, selectedWarehouse.code].filter(Boolean)
+    : [warehouseFilter];
+
+  return warehouseAliases(row).some((alias) => selectedAliases.includes(alias));
+}
+
+function addPalletBalance(balances, item, warehouseKey, movement) {
+  if (!item || !warehouseKey) return;
+  const key = inventoryKey(item, warehouseKey);
+  balances.set(key, (balances.get(key) || 0) + movement);
+}
+
 function derivePalletBalances(activities) {
   const today = new Date().toISOString().slice(0, 10);
 
   return activities.reduce((balances, activity) => {
-    const activityWarehouseKey = getActivityWarehouseKey(activity);
-    if (!activity.product || !activityWarehouseKey || !activity.activity_date || activity.activity_date >= today) {
+    if (!activity.product || !activity.activity_date || activity.activity_date >= today) {
       return balances;
     }
 
-    const key = inventoryKey(activity.product, activityWarehouseKey);
-    balances.set(key, (balances.get(key) || 0) + signedActivityUnits(activity));
+    const movement = signedActivityUnits(activity);
+    warehouseAliases(activity).forEach((alias) => addPalletBalance(balances, activity.product, alias, movement));
     return balances;
   }, new Map());
+}
+
+function deriveActivityInventoryRows(activities) {
+  const today = new Date().toISOString().slice(0, 10);
+  const grouped = new Map();
+
+  activities.forEach((activity) => {
+    if (!activity.product || !activity.activity_date) return;
+
+    const warehouseKey = getActivityWarehouseKey(activity);
+    if (!warehouseKey) return;
+
+    const key = inventoryKey(activity.product, activity.warehouse_id || warehouseKey);
+    const current = grouped.get(key) || {
+      item: activity.product,
+      warehouse_id: activity.warehouse_id || "",
+      warehouse: getActivityWarehouseName(activity),
+      in_qty: 0,
+      reserved_qty: 0,
+      incoming_qty: 0,
+      pallets: 0,
+    };
+    const pieces = Number(activity.pieces) || 0;
+    const pallets = signedActivityUnits(activity);
+
+    if (activity.activity_date < today) {
+      current.in_qty += pieces;
+      current.pallets += pallets;
+    } else if (pieces < 0) {
+      current.reserved_qty += Math.abs(pieces);
+    } else if (pieces > 0) {
+      current.incoming_qty += pieces;
+    }
+
+    grouped.set(key, current);
+  });
+
+  return grouped;
 }
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
@@ -141,10 +213,6 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
   }
 
   return rows;
-}
-
-function rowMatchesWarehouse(row, warehouseFilter) {
-  return warehouseFilter === ALL_WAREHOUSES || row.warehouse_id === warehouseFilter || row.warehouse === warehouseFilter;
 }
 
 function calculateCharges(monthKey, activities, rates, invoices) {
@@ -249,6 +317,7 @@ export default function InventoryManagementSystem() {
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
+  const [inventorySort, setInventorySort] = useState({ key: "item", direction: "asc" });
   const isOwner = profile?.role === "owner" || profile?.role === "admin";
   const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
   const assignedWarehouse = warehouses.find((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
@@ -518,7 +587,7 @@ export default function InventoryManagementSystem() {
 
   const visibleActivities = activities.filter(
     (a) =>
-      rowMatchesWarehouse(a, warehouse) &&
+      rowMatchesWarehouse(a, warehouse, warehouses) &&
       JSON.stringify(a).toLowerCase().includes(query.toLowerCase()),
   );
   const sortedActivities = useMemo(() => {
@@ -534,15 +603,46 @@ export default function InventoryManagementSystem() {
   }, [activitySort, visibleActivities]);
 
   const palletBalances = useMemo(() => derivePalletBalances(activities), [activities]);
+  const activityInventoryRows = useMemo(() => deriveActivityInventoryRows(activities), [activities]);
   const visibleInventory = useMemo(
-    () => inventoryLedger
-      .filter((i) => rowMatchesWarehouse(i, warehouse))
-      .map((row) => ({
-        ...row,
-        pallets: palletBalances.get(inventoryKey(row.item, row.warehouse_id || row.warehouse)) || 0,
-      })),
-    [inventoryLedger, palletBalances, warehouse],
+    () => {
+      const rowsByKey = new Map(activityInventoryRows);
+
+      inventoryLedger.forEach((row) => {
+        const rowWarehouseKey = row.warehouse_id || row.warehouse;
+        const key = inventoryKey(row.item, rowWarehouseKey);
+        const existing = rowsByKey.get(key);
+        const pallets =
+          warehouseAliases(row).map((alias) => palletBalances.get(inventoryKey(row.item, alias))).find((value) => value !== undefined) ?? 0;
+
+        rowsByKey.set(key, {
+          ...row,
+          ...(existing || {}),
+          item: row.item,
+          warehouse_id: row.warehouse_id || existing?.warehouse_id || "",
+          warehouse: row.warehouse || existing?.warehouse || "",
+          in_qty: row.in_qty ?? existing?.in_qty ?? 0,
+          reserved_qty: row.reserved_qty ?? existing?.reserved_qty ?? 0,
+          incoming_qty: row.incoming_qty ?? existing?.incoming_qty ?? 0,
+          pallets,
+        });
+      });
+
+      return Array.from(rowsByKey.values()).filter((row) => rowMatchesWarehouse(row, warehouse, warehouses));
+    },
+    [activityInventoryRows, inventoryLedger, palletBalances, warehouse, warehouses],
   );
+  const sortedInventory = useMemo(() => {
+    const direction = inventorySort.direction === "asc" ? 1 : -1;
+    return [...visibleInventory].sort((a, b) => {
+      const aValue = a[inventorySort.key] ?? "";
+      const bValue = b[inventorySort.key] ?? "";
+      if (Number.isFinite(Number(aValue)) && Number.isFinite(Number(bValue))) {
+        return (Number(aValue) - Number(bValue)) * direction;
+      }
+      return String(aValue).localeCompare(String(bValue)) * direction;
+    });
+  }, [inventorySort, visibleInventory]);
   const visibleChargeMonths = useMemo(
     () => Array.from(new Set([
       ...chargeMonths,
@@ -609,7 +709,11 @@ export default function InventoryManagementSystem() {
     }
 
     setActivities((current) =>
-      current.map((activity) => activity.id === activityId ? { ...activity, ...payload } : activity),
+      current.map((activity) =>
+        activity.id === activityId
+          ? normalizeActivity({ ...activity, ...payload, warehouses: field === "warehouse_id" ? selectedWarehouse : activity.warehouses })
+          : activity,
+      ),
     );
 
     if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) {
@@ -844,7 +948,7 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Warehouse could not be saved.");
+      setErrorMessage(`Warehouse could not be saved: ${error.message}`);
       return;
     }
 
@@ -898,7 +1002,7 @@ export default function InventoryManagementSystem() {
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner }} />}
-            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse)?.name || warehouse} rows={visibleInventory} />}
+            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
             {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} />}
             {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
@@ -1066,10 +1170,50 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
   );
 }
 
-function InventoryView({ warehouse, rows }) {
+function InventoryView({ warehouse, rows, sort, setSort }) {
+  const columns = [
+    ["item", "Item"],
+    ["pallets", "Pallets"],
+    ["in_qty", "Pcs"],
+    ["reserved_qty", "Reserved"],
+    ["incoming_qty", "Incoming"],
+  ];
+
+  function toggleSort(key) {
+    setSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+    }));
+  }
+
   return <>
-    <Header title={`Inventory — ${warehouse}`} />
-    <Table headers={["Item", "Pallets", "Pcs", "Reserved", "Incoming"]} rows={rows.map((r) => [r.item, r.pallets, r.in_qty, r.reserved_qty, r.incoming_qty])} />
+    <Header title={`Inventory - ${warehouse}`} />
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-100 text-slate-600">
+          <tr>
+            {columns.map(([key, label]) => (
+              <th key={key} className="text-left px-4 py-3 font-semibold">
+                <button className="font-semibold hover:text-slate-900" onClick={() => toggleSort(key)}>
+                  {label}{sort.key === key ? sort.direction === "asc" ? " ↑" : " ↓" : ""}
+                </button>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={`${row.item}-${row.warehouse_id || row.warehouse || index}`} className="border-t hover:bg-slate-50">
+              <td className="px-4 py-3 align-top">{row.item}</td>
+              <td className="px-4 py-3 align-top">{Number(row.pallets) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.in_qty) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.reserved_qty) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.incoming_qty) || 0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   </>;
 }
 
