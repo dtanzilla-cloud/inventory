@@ -85,10 +85,6 @@ function normalizeProfile(profile) {
   };
 }
 
-function getActivityWarehouseName(activity) {
-  return activity.warehouse_name || activity.warehouses?.name || activity.warehouse || "Unassigned";
-}
-
 function inventoryKey(item, warehouseKey) {
   return `${item || ""}::${warehouseKey || ""}`;
 }
@@ -136,7 +132,29 @@ function addPalletBalance(balances, item, warehouseKey, movement) {
   balances.set(key, (balances.get(key) || 0) + movement);
 }
 
-function derivePalletBalances(activities, warehouseRecords = []) {
+function addInventoryRow(grouped, row, groupMode) {
+  const item = row.item || row.product;
+  if (!item) return;
+
+  const key = groupMode === "all" ? item : inventoryKey(item, row.warehouse_id || row.warehouse);
+  const current = grouped.get(key) || {
+    item,
+    warehouse_id: groupMode === "all" ? "" : row.warehouse_id || "",
+    warehouse: groupMode === "all" ? ALL_WAREHOUSES : row.warehouse || "",
+    pallets: 0,
+    in_qty: 0,
+    reserved_qty: 0,
+    incoming_qty: 0,
+  };
+
+  current.pallets += Number(row.pallets) || 0;
+  current.in_qty += Number(row.in_qty) || 0;
+  current.reserved_qty += Number(row.reserved_qty) || 0;
+  current.incoming_qty += Number(row.incoming_qty) || 0;
+  grouped.set(key, current);
+}
+
+function derivePalletRows(activities, warehouseRecords = []) {
   const today = new Date().toISOString().slice(0, 10);
 
   return activities.reduce((balances, activity) => {
@@ -150,43 +168,46 @@ function derivePalletBalances(activities, warehouseRecords = []) {
   }, new Map());
 }
 
-function deriveActivityInventoryRows(activities, warehouseRecords = []) {
-  const today = new Date().toISOString().slice(0, 10);
+function buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter, warehouseRecords = [] }) {
+  const groupMode = warehouseFilter === ALL_WAREHOUSES ? "all" : "warehouse";
   const grouped = new Map();
+  const palletRows = derivePalletRows(activities, warehouseRecords);
 
-  activities.forEach((activity) => {
-    if (!activity.product || !activity.activity_date) return;
-
-    const warehouseKey = canonicalWarehouseKey(activity, warehouseRecords);
-    if (!warehouseKey) return;
-
+  palletRows.forEach((pallets, key) => {
+    const [item, warehouseKey] = key.split("::");
     const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
-    const key = inventoryKey(activity.product, warehouseKey);
-    const current = grouped.get(key) || {
-      item: activity.product,
-      warehouse_id: matchedWarehouse?.id || activity.warehouse_id || "",
-      warehouse: matchedWarehouse?.name || getActivityWarehouseName(activity),
+    const row = {
+      item,
+      warehouse_id: matchedWarehouse?.id || warehouseKey,
+      warehouse: matchedWarehouse?.name || warehouseKey,
+      pallets,
       in_qty: 0,
       reserved_qty: 0,
       incoming_qty: 0,
-      pallets: 0,
     };
-    const pieces = Number(activity.pieces) || 0;
-    const pallets = signedActivityUnits(activity);
 
-    if (activity.activity_date < today) {
-      current.in_qty += pieces;
-      current.pallets += pallets;
-    } else if (pieces < 0) {
-      current.reserved_qty += Math.abs(pieces);
-    } else if (pieces > 0) {
-      current.incoming_qty += pieces;
-    }
-
-    grouped.set(key, current);
+    if (rowMatchesWarehouse(row, warehouseFilter, warehouseRecords)) addInventoryRow(grouped, row, groupMode);
   });
 
-  return grouped;
+  inventoryLedger.forEach((ledgerRow) => {
+    if (!rowMatchesWarehouse(ledgerRow, warehouseFilter, warehouseRecords)) return;
+
+    const warehouseKey = canonicalWarehouseKey(ledgerRow, warehouseRecords);
+    const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
+    const row = {
+      item: ledgerRow.item,
+      warehouse_id: matchedWarehouse?.id || ledgerRow.warehouse_id || warehouseKey,
+      warehouse: matchedWarehouse?.name || ledgerRow.warehouse || warehouseKey,
+      pallets: 0,
+      in_qty: ledgerRow.in_qty,
+      reserved_qty: ledgerRow.reserved_qty,
+      incoming_qty: ledgerRow.incoming_qty,
+    };
+
+    addInventoryRow(grouped, row, groupMode);
+  });
+
+  return Array.from(grouped.values());
 }
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
@@ -607,35 +628,9 @@ export default function InventoryManagementSystem() {
     });
   }, [activitySort, visibleActivities]);
 
-  const palletBalances = useMemo(() => derivePalletBalances(activities, warehouses), [activities, warehouses]);
-  const activityInventoryRows = useMemo(() => deriveActivityInventoryRows(activities, warehouses), [activities, warehouses]);
   const visibleInventory = useMemo(
-    () => {
-      const rowsByKey = new Map(activityInventoryRows);
-
-      inventoryLedger.forEach((row) => {
-        const rowWarehouseKey = canonicalWarehouseKey(row, warehouses);
-        const key = inventoryKey(row.item, rowWarehouseKey);
-        const existing = rowsByKey.get(key);
-        const pallets = palletBalances.get(key) ?? existing?.pallets ?? 0;
-        const matchedWarehouse = warehouseRecordForFilter(rowWarehouseKey, warehouses);
-
-        rowsByKey.set(key, {
-          ...row,
-          ...(existing || {}),
-          item: row.item,
-          warehouse_id: matchedWarehouse?.id || row.warehouse_id || existing?.warehouse_id || "",
-          warehouse: matchedWarehouse?.name || row.warehouse || existing?.warehouse || "",
-          in_qty: row.in_qty ?? existing?.in_qty ?? 0,
-          reserved_qty: row.reserved_qty ?? existing?.reserved_qty ?? 0,
-          incoming_qty: row.incoming_qty ?? existing?.incoming_qty ?? 0,
-          pallets,
-        });
-      });
-
-      return Array.from(rowsByKey.values()).filter((row) => rowMatchesWarehouse(row, warehouse, warehouses));
-    },
-    [activityInventoryRows, inventoryLedger, palletBalances, warehouse, warehouses],
+    () => buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter: warehouse, warehouseRecords: warehouses }),
+    [activities, inventoryLedger, warehouse, warehouses],
   );
   const sortedInventory = useMemo(() => {
     const direction = inventorySort.direction === "asc" ? 1 : -1;
