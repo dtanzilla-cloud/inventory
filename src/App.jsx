@@ -249,6 +249,7 @@ export default function InventoryManagementSystem() {
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
+  const [editingCell, setEditingCell] = useState(null);
   const isOwner = profile?.role === "owner" || profile?.role === "admin";
   const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
   const assignedWarehouse = warehouses.find((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
@@ -589,6 +590,7 @@ export default function InventoryManagementSystem() {
 
     setActivitySort({ key: "activity_date", direction: "desc" });
     setActivities((current) => [normalizeActivity(data), ...current]);
+    setEditingCell({ activityId: data.id, field: "product" });
     await loadInventoryLedger();
   }
 
@@ -897,7 +899,7 @@ export default function InventoryManagementSystem() {
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner }} />}
+            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, editingCell, setEditingCell }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse)?.name || warehouse} rows={visibleInventory} />}
             {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} />}
@@ -958,7 +960,7 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner }) {
+function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, editingCell, setEditingCell }) {
   const columns = [
     ["activity_date", "Date"],
     ["warehouse", "Warehouse"],
@@ -981,6 +983,16 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
       key,
       direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
     }));
+  }
+
+  function editProps(activityId, field) {
+    return {
+      active: editingCell?.activityId === activityId && editingCell?.field === field,
+      onActivate: () => setEditingCell({ activityId, field }),
+      onDeactivate: () => setEditingCell((current) =>
+        current?.activityId === activityId && current?.field === field ? null : current,
+      ),
+    };
   }
 
   return <>
@@ -1009,16 +1021,16 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
           <tbody>
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" disabled={!isOwner} value={activity.warehouse_id || ""} displayValue={getActivityWarehouseName(activity)} options={warehouses.map((warehouseRecord) => ({ value: warehouseRecord.id, label: warehouseLabel(warehouseRecord) }))} onSave={(value) => updateActivity(activity.id, "warehouse_id", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} onSave={(value) => updateActivity(activity.id, "product", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} onSave={(value) => updateActivity(activity.id, "customer", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} onSave={(value) => updateActivity(activity.id, "supplier", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" disabled={!isOwner} value={activity.warehouse_id || ""} displayValue={getActivityWarehouseName(activity)} options={warehouses.map((warehouseRecord) => ({ value: warehouseRecord.id, label: warehouseLabel(warehouseRecord) }))} onSave={(value) => updateActivity(activity.id, "warehouse_id", value)} {...editProps(activity.id, "warehouse_id")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "customer", value)} {...editProps(activity.id, "customer")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} {...editProps(activity.id, "lot_number")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "supplier", value)} {...editProps(activity.id, "supplier")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} {...editProps(activity.id, "repack")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} {...editProps(activity.id, "note")} /></td>
                 <td className="px-4 py-3 align-top"><DocUpload documents={activity.documents} uploading={uploadingActivityId === activity.id} onChange={(files) => uploadDocuments(activity.id, files)} /></td>
                 <td className="px-4 py-3 align-top"><Button size="sm" variant="ghost" onClick={() => deleteActivity(activity.id)}><Trash2 size={16} /></Button></td>
               </tr>
@@ -1030,7 +1042,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
   </>;
 }
 
-function EditableCell({ value = "", displayValue, type = "text", options = [], disabled = false, onSave }) {
+function EditableCell({ value = "", displayValue, type = "text", options = [], disabled = false, emptyOptionsFallback = false, active = false, onActivate, onDeactivate, onSave }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value ?? "");
 
@@ -1039,18 +1051,65 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
     setDraft(value ?? "");
   }, [value]);
 
-  async function save() {
+  useEffect(() => {
+    if (active) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setEditing(true);
+    }
+  }, [active]);
+
+  function startEditing() {
+    setEditing(true);
+    onActivate?.();
+  }
+
+  function stopEditing() {
     setEditing(false);
+    onDeactivate?.();
+  }
+
+  async function save() {
+    stopEditing();
     if (String(draft ?? "") !== String(value ?? "")) await onSave(draft);
   }
 
+  function cancel() {
+    setDraft(value ?? "");
+    stopEditing();
+  }
+
+  function handleKeyDown(event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.currentTarget.blur();
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  }
+
   if (!editing) {
-    return <button className="min-h-6 w-full text-left disabled:cursor-not-allowed" disabled={disabled} onClick={() => setEditing(true)}>{displayValue || value || "-"}</button>;
+    return <button className="min-h-6 w-full text-left disabled:cursor-not-allowed" disabled={disabled} onClick={startEditing}>{displayValue || value || "-"}</button>;
   }
 
   if (type === "select") {
+    if (emptyOptionsFallback && options.length === 0) {
+      return (
+        <input
+          className="w-full rounded border px-2 py-1"
+          autoFocus
+          placeholder="No options - type value"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={save}
+          onKeyDown={handleKeyDown}
+        />
+      );
+    }
+
     return (
-      <select className="w-full rounded border px-2 py-1" autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}>
+      <select className="w-full rounded border px-2 py-1" autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown}>
         <option value=""></option>
         {options.map((option) => {
           const optionValue = typeof option === "object" ? option.value : option;
@@ -1062,7 +1121,7 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
   }
 
   return (
-    <input className="w-full rounded border px-2 py-1" autoFocus type={type} value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+    <input className="w-full rounded border px-2 py-1" autoFocus type={type} value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown} />
   );
 }
 
