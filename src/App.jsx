@@ -65,11 +65,6 @@ function warehouseName(warehouse) {
   return warehouse?.name || warehouse?.warehouse || "";
 }
 
-function warehouseLabel(warehouse) {
-  if (!warehouse) return "";
-  return warehouse.code ? `${warehouse.name} (${warehouse.code})` : warehouse.name;
-}
-
 function normalizeWarehouse(warehouse) {
   return {
     id: warehouse.id,
@@ -87,34 +82,133 @@ function normalizeProfile(profile) {
     warehouse_id: profile?.warehouse_id || "",
     warehouse_name: profile?.warehouses?.name || profile?.warehouse || "",
     warehouse_code: profile?.warehouses?.code || "",
+    active: profile?.active !== false,
   };
-}
-
-function getActivityWarehouseName(activity) {
-  return activity.warehouse_name || activity.warehouses?.name || activity.warehouse || "Unassigned";
-}
-
-function getActivityWarehouseKey(activity) {
-  return activity.warehouse_id || getActivityWarehouseName(activity);
 }
 
 function inventoryKey(item, warehouseKey) {
   return `${item || ""}::${warehouseKey || ""}`;
 }
 
-function derivePalletBalances(activities) {
+function warehouseAliases(row) {
+  return [
+    row?.warehouse_id,
+    row?.warehouse,
+    row?.warehouse_name,
+    row?.warehouse_code,
+    row?.warehouses?.id,
+    row?.warehouses?.name,
+    row?.warehouses?.code,
+  ].filter(Boolean);
+}
+
+function warehouseRecordForFilter(warehouseFilter, warehouseRecords) {
+  return warehouseRecords.find((warehouseRecord) =>
+    [warehouseRecord.id, warehouseRecord.name, warehouseRecord.code].filter(Boolean).includes(warehouseFilter),
+  );
+}
+
+function rowMatchesWarehouse(row, warehouseFilter, warehouseRecords = []) {
+  if (warehouseFilter === ALL_WAREHOUSES) return true;
+
+  const selectedWarehouse = warehouseRecordForFilter(warehouseFilter, warehouseRecords);
+  const selectedAliases = selectedWarehouse
+    ? [selectedWarehouse.id, selectedWarehouse.name, selectedWarehouse.code].filter(Boolean)
+    : [warehouseFilter];
+
+  return warehouseAliases(row).some((alias) => selectedAliases.includes(alias));
+}
+
+function canonicalWarehouseKey(row, warehouseRecords = []) {
+  const matchedWarehouse = warehouseAliases(row)
+    .map((alias) => warehouseRecordForFilter(alias, warehouseRecords))
+    .find(Boolean);
+
+  return matchedWarehouse?.id || row?.warehouse_id || row?.warehouse || row?.warehouse_name || row?.warehouse_code || "";
+}
+
+function addPalletBalance(balances, item, warehouseKey, movement) {
+  if (!item || !warehouseKey) return;
+  const key = inventoryKey(item, warehouseKey);
+  balances.set(key, (balances.get(key) || 0) + movement);
+}
+
+function addInventoryRow(grouped, row, groupMode) {
+  const item = row.item || row.product;
+  if (!item) return;
+
+  const key = groupMode === "all" ? item : inventoryKey(item, row.warehouse_id || row.warehouse);
+  const current = grouped.get(key) || {
+    item,
+    warehouse_id: groupMode === "all" ? "" : row.warehouse_id || "",
+    warehouse: groupMode === "all" ? ALL_WAREHOUSES : row.warehouse || "",
+    pallets: 0,
+    in_qty: 0,
+    reserved_qty: 0,
+    incoming_qty: 0,
+  };
+
+  current.pallets += Number(row.pallets) || 0;
+  current.in_qty += Number(row.in_qty) || 0;
+  current.reserved_qty += Number(row.reserved_qty) || 0;
+  current.incoming_qty += Number(row.incoming_qty) || 0;
+  grouped.set(key, current);
+}
+
+function derivePalletRows(activities, warehouseRecords = []) {
   const today = new Date().toISOString().slice(0, 10);
 
   return activities.reduce((balances, activity) => {
-    const activityWarehouseKey = getActivityWarehouseKey(activity);
-    if (!activity.product || !activityWarehouseKey || !activity.activity_date || activity.activity_date >= today) {
+    if (!activity.product || !activity.activity_date || activity.activity_date >= today) {
       return balances;
     }
 
-    const key = inventoryKey(activity.product, activityWarehouseKey);
-    balances.set(key, (balances.get(key) || 0) + signedActivityUnits(activity));
+    const movement = signedActivityUnits(activity);
+    addPalletBalance(balances, activity.product, canonicalWarehouseKey(activity, warehouseRecords), movement);
     return balances;
   }, new Map());
+}
+
+function buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter, warehouseRecords = [] }) {
+  const groupMode = warehouseFilter === ALL_WAREHOUSES ? "all" : "warehouse";
+  const grouped = new Map();
+  const palletRows = derivePalletRows(activities, warehouseRecords);
+
+  palletRows.forEach((pallets, key) => {
+    const [item, warehouseKey] = key.split("::");
+    const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
+    const row = {
+      item,
+      warehouse_id: matchedWarehouse?.id || warehouseKey,
+      warehouse: matchedWarehouse?.name || warehouseKey,
+      pallets,
+      in_qty: 0,
+      reserved_qty: 0,
+      incoming_qty: 0,
+    };
+
+    if (rowMatchesWarehouse(row, warehouseFilter, warehouseRecords)) addInventoryRow(grouped, row, groupMode);
+  });
+
+  inventoryLedger.forEach((ledgerRow) => {
+    if (!rowMatchesWarehouse(ledgerRow, warehouseFilter, warehouseRecords)) return;
+
+    const warehouseKey = canonicalWarehouseKey(ledgerRow, warehouseRecords);
+    const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
+    const row = {
+      item: ledgerRow.item,
+      warehouse_id: matchedWarehouse?.id || ledgerRow.warehouse_id || warehouseKey,
+      warehouse: matchedWarehouse?.name || ledgerRow.warehouse || warehouseKey,
+      pallets: 0,
+      in_qty: ledgerRow.in_qty,
+      reserved_qty: ledgerRow.reserved_qty,
+      incoming_qty: ledgerRow.incoming_qty,
+    };
+
+    addInventoryRow(grouped, row, groupMode);
+  });
+
+  return Array.from(grouped.values());
 }
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
@@ -141,10 +235,6 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
   }
 
   return rows;
-}
-
-function rowMatchesWarehouse(row, warehouseFilter) {
-  return warehouseFilter === ALL_WAREHOUSES || row.warehouse_id === warehouseFilter || row.warehouse === warehouseFilter;
 }
 
 function calculateCharges(monthKey, activities, rates, invoices) {
@@ -187,6 +277,10 @@ function calculateCharges(monthKey, activities, rates, invoices) {
   };
 }
 
+function filterRowsByWarehouse(rows, warehouseFilter, warehouseRecords = []) {
+  return rows.filter((row) => rowMatchesWarehouse(row, warehouseFilter, warehouseRecords));
+}
+
 function normalizeActivity(activity) {
   return {
     ...activity,
@@ -208,16 +302,54 @@ const masterDataConfig = {
   Suppliers: { table: "suppliers", activityField: "supplier", hasSku: false },
 };
 
-function parseCsvNames(text, hasSku = false) {
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const [firstLine] = lines;
-  const hasHeader = firstLine?.toLowerCase().includes("name");
-  const dataLines = hasHeader ? lines.slice(1) : lines;
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let quoted = false;
 
-  return dataLines.map((line) => {
-    const [name, sku] = line.split(",").map((value) => value?.trim() || "");
-    return hasSku ? { name, sku, active: true } : { name, active: true };
-  }).filter((row) => row.name);
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const nextChar = line[index + 1];
+
+    if (char === '"' && quoted && nextChar === '"') {
+      current += '"';
+      index += 1;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      values.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current.trim());
+  return values;
+}
+
+function parseCsvNames(text, hasSku = false) {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const [firstLine] = lines;
+  const firstValues = parseCsvLine(firstLine || "").map((value) => value.toLowerCase());
+  const hasHeader = firstValues.includes("name") || firstValues.includes("sku");
+  const nameIndex = hasHeader ? Math.max(firstValues.indexOf("name"), 0) : 0;
+  const skuIndex = hasHeader ? firstValues.indexOf("sku") : 1;
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+  const seenNames = new Set();
+
+  return dataLines.reduce((rows, line) => {
+    const values = parseCsvLine(line);
+    const name = (values[nameIndex] || "").trim();
+    const sku = (values[skuIndex] || "").trim();
+    const normalizedName = name.toLowerCase();
+
+    if (!name || seenNames.has(normalizedName)) return rows;
+
+    seenNames.add(normalizedName);
+    rows.push(hasSku ? { name, sku: sku || null, active: true } : { name, active: true });
+    return rows;
+  }, []);
 }
 
 function optionNames(records, rawValue) {
@@ -231,6 +363,8 @@ export default function InventoryManagementSystem() {
   const [profiles, setProfiles] = useState([]);
   const [section, setSection] = useState("Activities");
   const [warehouse, setWarehouse] = useState(ALL_WAREHOUSES);
+  const [activityWarehouse, setActivityWarehouse] = useState(ALL_WAREHOUSES);
+  const [chargesWarehouse, setChargesWarehouse] = useState(ALL_WAREHOUSES);
   const [warehouses, setWarehouses] = useState([DEFAULT_WAREHOUSE]);
   const [activities, setActivities] = useState([]);
   const [inventoryLedger, setInventoryLedger] = useState([]);
@@ -250,6 +384,8 @@ export default function InventoryManagementSystem() {
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
   const [editingCell, setEditingCell] = useState(null);
+  const [inventorySort, setInventorySort] = useState({ key: "item", direction: "asc" });
+  const [successMessage, setSuccessMessage] = useState("");
   const isOwner = profile?.role === "owner" || profile?.role === "admin";
   const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
   const assignedWarehouse = warehouses.find((warehouseRecord) => warehouseRecord.id === profile?.warehouse_id);
@@ -292,9 +428,9 @@ export default function InventoryManagementSystem() {
     loadActivities(profile);
     loadWarehouses(profile);
     loadMasterData();
+    loadCharges();
     if (isOwner) {
       loadProfiles();
-      loadCharges();
     }
     loadInventoryLedger(profile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -302,10 +438,11 @@ export default function InventoryManagementSystem() {
 
   async function loadProfile(user) {
     setErrorMessage("");
+    setSuccessMessage("");
 
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
+      .select("id, email, role, warehouse, warehouse_id, active, warehouses:warehouse_id(id, code, name)")
       .eq("id", user.id)
       .single();
 
@@ -318,9 +455,18 @@ export default function InventoryManagementSystem() {
 
     const nextProfile = normalizeProfile(data);
 
+    if (!nextProfile.active) {
+      setErrorMessage("This profile is inactive. Contact an owner to restore access.");
+      setProfile(null);
+      return;
+    }
+
     if (nextProfile.role === "warehouse") {
-      setWarehouse(nextProfile.warehouse_id || nextProfile.warehouse_name);
-      if (["Charges", "Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
+      const assignedWarehouseFilter = nextProfile.warehouse_id || nextProfile.warehouse_name;
+      setWarehouse(assignedWarehouseFilter);
+      setActivityWarehouse(assignedWarehouseFilter);
+      setChargesWarehouse(assignedWarehouseFilter);
+      if (["Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
     }
 
     setProfile(nextProfile);
@@ -329,7 +475,7 @@ export default function InventoryManagementSystem() {
   async function loadProfiles() {
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, role, warehouse, warehouse_id, warehouses:warehouse_id(id, code, name)")
+      .select("id, email, role, warehouse, warehouse_id, active, warehouses:warehouse_id(id, code, name)")
       .order("email", { ascending: true });
 
     if (error) {
@@ -365,7 +511,10 @@ export default function InventoryManagementSystem() {
 
     if (activeProfile?.role === "warehouse") {
       const selectedWarehouse = safeWarehouses.find((warehouseRecord) => warehouseRecord.id === activeProfile.warehouse_id);
-      setWarehouse(selectedWarehouse?.id || activeProfile.warehouse_name || activeProfile.warehouse || DEFAULT_WAREHOUSE.name);
+      const assignedWarehouseFilter = selectedWarehouse?.id || activeProfile.warehouse_name || activeProfile.warehouse || DEFAULT_WAREHOUSE.name;
+      setWarehouse(assignedWarehouseFilter);
+      setActivityWarehouse(assignedWarehouseFilter);
+      setChargesWarehouse(assignedWarehouseFilter);
     }
   }
 
@@ -392,6 +541,7 @@ export default function InventoryManagementSystem() {
 
     setLoading(true);
     setErrorMessage("");
+    setSuccessMessage("");
 
     let activityQuery = supabase
       .from("activities")
@@ -483,7 +633,7 @@ export default function InventoryManagementSystem() {
 
     const [ratesResult, invoicesResult, summariesResult] = await Promise.all([
       supabase.from("billing_rates").select("month, storage_rate, inbound_rate, outbound_rate").order("month", { ascending: false }),
-      supabase.from("charge_invoices").select("id, month, file_name, file_url, status").order("created_at", { ascending: false }),
+      supabase.from("charge_invoices").select("id, month, warehouse_id, file_name, file_url, status, warehouses:warehouse_id(id, code, name)").order("created_at", { ascending: false }),
       supabase.from("monthly_charge_summaries").select("*").order("month", { ascending: false }),
     ]);
 
@@ -498,7 +648,11 @@ export default function InventoryManagementSystem() {
       acc[rate.month] = rate;
       return acc;
     }, {});
-    const nextInvoices = (invoicesResult.data || []).reduce((acc, invoice) => {
+    const nextInvoices = (invoicesResult.data || []).map((invoice) => ({
+      ...invoice,
+      warehouse_name: invoice.warehouses?.name || "",
+      warehouse_code: invoice.warehouses?.code || "",
+    })).reduce((acc, invoice) => {
       acc[invoice.month] = [...(acc[invoice.month] || []), invoice];
       return acc;
     }, {});
@@ -519,7 +673,7 @@ export default function InventoryManagementSystem() {
 
   const visibleActivities = activities.filter(
     (a) =>
-      rowMatchesWarehouse(a, warehouse) &&
+      rowMatchesWarehouse(a, activityWarehouse, warehouses) &&
       JSON.stringify(a).toLowerCase().includes(query.toLowerCase()),
   );
   const sortedActivities = useMemo(() => {
@@ -534,16 +688,21 @@ export default function InventoryManagementSystem() {
     });
   }, [activitySort, visibleActivities]);
 
-  const palletBalances = useMemo(() => derivePalletBalances(activities), [activities]);
   const visibleInventory = useMemo(
-    () => inventoryLedger
-      .filter((i) => rowMatchesWarehouse(i, warehouse))
-      .map((row) => ({
-        ...row,
-        pallets: palletBalances.get(inventoryKey(row.item, row.warehouse_id || row.warehouse)) || 0,
-      })),
-    [inventoryLedger, palletBalances, warehouse],
+    () => buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter: warehouse, warehouseRecords: warehouses }),
+    [activities, inventoryLedger, warehouse, warehouses],
   );
+  const sortedInventory = useMemo(() => {
+    const direction = inventorySort.direction === "asc" ? 1 : -1;
+    return [...visibleInventory].sort((a, b) => {
+      const aValue = a[inventorySort.key] ?? "";
+      const bValue = b[inventorySort.key] ?? "";
+      if (Number.isFinite(Number(aValue)) && Number.isFinite(Number(bValue))) {
+        return (Number(aValue) - Number(bValue)) * direction;
+      }
+      return String(aValue).localeCompare(String(bValue)) * direction;
+    });
+  }, [inventorySort, visibleInventory]);
   const visibleChargeMonths = useMemo(
     () => Array.from(new Set([
       ...chargeMonths,
@@ -553,11 +712,19 @@ export default function InventoryManagementSystem() {
   );
   const selectedChargeMonth = month || visibleChargeMonths[0] || DEFAULT_CHARGE_MONTH;
   const chargeMonthKey = monthKeyFromLabel(selectedChargeMonth);
+  const chargeActivities = useMemo(
+    () => filterRowsByWarehouse(activities, chargesWarehouse, warehouses),
+    [activities, chargesWarehouse, warehouses],
+  );
+  const visibleChargeInvoices = useMemo(
+    () => filterRowsByWarehouse(chargeInvoices[chargeMonthKey] || [], chargesWarehouse, warehouses),
+    [chargeInvoices, chargeMonthKey, chargesWarehouse, warehouses],
+  );
   const charges = calculateCharges(
     chargeMonthKey,
-    activities,
+    chargeActivities,
     billingRates[chargeMonthKey],
-    chargeInvoices[chargeMonthKey] || [],
+    visibleChargeInvoices,
   );
 
   async function addEvent() {
@@ -565,7 +732,7 @@ export default function InventoryManagementSystem() {
     const selectedWarehouse =
       profile.role === "warehouse"
         ? assignedWarehouse || defaultWarehouse
-        : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse) || defaultWarehouse;
+        : warehouseRecordForFilter(activityWarehouse, warehouses) || defaultWarehouse;
     const payload = {
       activity_date: new Date().toISOString().slice(0, 10),
       warehouse_id: selectedWarehouse.id || null,
@@ -584,7 +751,7 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Insert failed in Supabase.");
+      setErrorMessage(`Insert failed in Supabase: ${error.message}`);
       return;
     }
 
@@ -601,18 +768,31 @@ export default function InventoryManagementSystem() {
       ? { warehouse_id: selectedWarehouse?.id || null, warehouse: selectedWarehouse?.name || "" }
       : { [field]: numberFields.includes(field) ? Number(value || 0) : value };
 
-    const { error } = await supabase.from("activities").update(payload).eq("id", activityId);
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    const { data, error } = await supabase
+      .from("activities")
+      .update(payload)
+      .eq("id", activityId)
+      .select("*, warehouses:warehouse_id(id, code, name)")
+      .single();
 
     if (error) {
       console.error(error);
-      setErrorMessage("Activity update failed.");
+      setErrorMessage(`Activity update failed: ${error.message}`);
       await loadActivities();
       return;
     }
 
     setActivities((current) =>
-      current.map((activity) => activity.id === activityId ? { ...activity, ...payload } : activity),
+      current.map((activity) =>
+        activity.id === activityId
+          ? { ...normalizeActivity(data), documents: activity.documents }
+          : activity,
+      ),
     );
+    setSuccessMessage("Activity saved.");
 
     if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) {
       await loadInventoryLedger();
@@ -626,7 +806,7 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Delete failed in Supabase.");
+      setErrorMessage(`Delete failed in Supabase: ${error.message}`);
       return;
     }
 
@@ -719,6 +899,8 @@ export default function InventoryManagementSystem() {
     if (files.length === 0) return;
 
     const targetMonth = monthKeyFromLabel(monthLabel);
+    const selectedWarehouse = warehouseRecordForFilter(chargesWarehouse, warehouses);
+    const invoiceScope = selectedWarehouse?.id || ALL_WAREHOUSES.toLowerCase();
     setUploadingInvoice(true);
     setErrorMessage("");
 
@@ -726,7 +908,7 @@ export default function InventoryManagementSystem() {
       const uploadedInvoices = [];
 
       for (const file of files) {
-        const storagePath = `${targetMonth}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
+        const storagePath = `${invoiceScope}/${targetMonth}/${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
         const { error: uploadError } = await supabase.storage
           .from(CHARGE_INVOICE_BUCKET)
           .upload(storagePath, file, { upsert: false, contentType: file.type || "application/pdf" });
@@ -739,12 +921,16 @@ export default function InventoryManagementSystem() {
 
         const { data: invoice, error: invoiceError } = await supabase
           .from("charge_invoices")
-          .insert([{ month: targetMonth, file_name: file.name, file_url: publicUrlData.publicUrl, status: "PAID" }])
-          .select("id, month, file_name, file_url, status")
+          .insert([{ month: targetMonth, warehouse_id: selectedWarehouse?.id || null, file_name: file.name, file_url: publicUrlData.publicUrl, status: "PAID" }])
+          .select("id, month, warehouse_id, file_name, file_url, status, warehouses:warehouse_id(id, code, name)")
           .single();
 
         if (invoiceError) throw invoiceError;
-        uploadedInvoices.push(invoice);
+        uploadedInvoices.push({
+          ...invoice,
+          warehouse_name: invoice.warehouses?.name || selectedWarehouse?.name || null,
+          warehouse_code: invoice.warehouses?.code || selectedWarehouse?.code || null,
+        });
       }
 
       setChargeInvoices((current) => ({
@@ -753,7 +939,7 @@ export default function InventoryManagementSystem() {
       }));
     } catch (error) {
       console.error(error);
-      setErrorMessage("Invoice upload failed. Please try again.");
+      setErrorMessage(`Invoice upload failed: ${error.message || "Please try again."}`);
     } finally {
       setUploadingInvoice(false);
     }
@@ -761,6 +947,8 @@ export default function InventoryManagementSystem() {
 
   async function saveMasterRecord(kind, record) {
     const config = masterDataConfig[kind];
+    setErrorMessage("");
+    setSuccessMessage("");
     const payload = config.hasSku
       ? { name: record.name, sku: record.sku || null, active: record.active !== false }
       : { name: record.name, active: record.active !== false };
@@ -772,11 +960,12 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage(`${kind} could not be saved.`);
+      setErrorMessage(`${kind} could not be saved: ${error.message}`);
       return;
     }
 
     await loadMasterData();
+    setSuccessMessage(`${kind} saved.`);
   }
 
   async function deleteMasterRecord(kind, record) {
@@ -813,19 +1002,46 @@ export default function InventoryManagementSystem() {
     if (!file) return;
 
     const config = masterDataConfig[kind];
+    setErrorMessage("");
+    setSuccessMessage("");
+
     const text = await file.text();
     const rows = parseCsvNames(text, config.hasSku);
-    if (rows.length === 0) return;
 
-    const { error } = await supabase.from(config.table).insert(rows);
+    if (rows.length === 0) {
+      setErrorMessage(`No valid ${kind.toLowerCase()} found in CSV.`);
+      return;
+    }
+
+    const { data: existingRecords, error: existingError } = await supabase
+      .from(config.table)
+      .select("name");
+
+    if (existingError) {
+      console.error(existingError);
+      setErrorMessage(`${kind} import failed: ${existingError.message}`);
+      return;
+    }
+
+    const existingNames = new Set((existingRecords || []).map((record) => record.name?.trim().toLowerCase()).filter(Boolean));
+    const rowsToInsert = rows.filter((row) => !existingNames.has(row.name.toLowerCase()));
+    const skippedCount = rows.length - rowsToInsert.length;
+
+    if (rowsToInsert.length === 0) {
+      setSuccessMessage(`Imported 0 ${kind.toLowerCase()}; skipped ${skippedCount} existing.`);
+      return;
+    }
+
+    const { error } = await supabase.from(config.table).insert(rowsToInsert);
 
     if (error) {
       console.error(error);
-      setErrorMessage(`${kind} CSV import failed.`);
+      setErrorMessage(`${kind} CSV import failed: ${error.message}`);
       return;
     }
 
     await loadMasterData();
+    setSuccessMessage(`Imported ${rowsToInsert.length} ${kind.toLowerCase()}${skippedCount ? `; skipped ${skippedCount} existing` : ""}.`);
   }
 
   async function saveWarehouse(warehouseRecord) {
@@ -846,13 +1062,77 @@ export default function InventoryManagementSystem() {
 
     if (error) {
       console.error(error);
-      setErrorMessage("Warehouse could not be saved.");
+      setErrorMessage(`Warehouse could not be saved: ${error.message}`);
       return;
     }
 
     await loadWarehouses(profile);
     await loadActivities(profile);
     await loadInventoryLedger(profile);
+  }
+
+  async function saveProfile(profileRecord) {
+    const email = profileRecord.email?.trim().toLowerCase();
+    const role = profileRecord.role || "warehouse";
+    const selectedWarehouse = warehouseRecordForFilter(profileRecord.warehouse_id, warehouses);
+
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    if (!email) {
+      setErrorMessage("User email is required.");
+      return;
+    }
+
+    if (role === "warehouse" && !selectedWarehouse?.id) {
+      setErrorMessage("Warehouse users must be assigned to an active warehouse.");
+      return;
+    }
+
+    const { data: existingProfiles, error: findError } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .eq("email", email)
+      .limit(1);
+
+    if (findError) {
+      console.error(findError);
+      setErrorMessage(`User lookup failed: ${findError.message}`);
+      return;
+    }
+
+    const existingProfile = profileRecord.id ? profileRecord : existingProfiles?.[0];
+
+    if (!existingProfile?.id) {
+      setErrorMessage(`No Supabase Auth user/profile exists for ${email}. Invite or create the Auth user first, then return here to assign role and warehouse.`);
+      return;
+    }
+
+    const payload = {
+      email,
+      role,
+      warehouse_id: role === "warehouse" ? selectedWarehouse.id : null,
+      warehouse: role === "warehouse" ? selectedWarehouse.name : null,
+      active: profileRecord.active !== false,
+    };
+
+    const { error } = await supabase
+      .from("profiles")
+      .update(payload)
+      .eq("id", existingProfile.id);
+
+    if (error) {
+      console.error(error);
+      setErrorMessage(`User profile could not be saved: ${error.message}`);
+      return;
+    }
+
+    await loadProfiles();
+    setSuccessMessage(`Profile saved for ${email}.`);
+  }
+
+  async function deactivateProfile(profileRecord) {
+    await saveProfile({ ...profileRecord, active: false });
   }
 
   if (authLoading) {
@@ -879,10 +1159,10 @@ export default function InventoryManagementSystem() {
           {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => { setSection("Inventory"); setWarehouse(ALL_WAREHOUSES); }}>All warehouses</NavButton>}
           {selectableWarehouses.map((warehouseRecord) => <NavButton key={warehouseRecord.id || warehouseRecord.code} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === warehouseRecord.id} onClick={() => { setSection("Inventory"); setWarehouse(warehouseRecord.id); }}>{warehouseRecord.name}</NavButton>)}
 
-          {isOwner && <>
-            <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-            <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
+          <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
+          <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
 
+          {isOwner && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
             <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
             <NavButton icon={<Warehouse size={18} />} active={section === "Warehouses"} onClick={() => setSection("Warehouses")}>Warehouses</NavButton>
@@ -899,10 +1179,11 @@ export default function InventoryManagementSystem() {
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, editingCell, setEditingCell }} />}
-            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouses.find((warehouseRecord) => warehouseRecord.id === warehouse)?.name || warehouse} rows={visibleInventory} />}
-            {section === "Charges" && isOwner && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} />}
-            {section === "Settings" && isOwner && <SettingsView profiles={profiles} />}
+            {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
+            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
+            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
+            {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
+            {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
             {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
             {section === "Products" && isOwner && <MasterDataView kind="Products" records={products} hasSku onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
             {section === "Customers" && isOwner && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
@@ -960,10 +1241,9 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, editingCell, setEditingCell }) {
+function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }) {
   const columns = [
     ["activity_date", "Date"],
-    ["warehouse", "Warehouse"],
     ["pallets", "Pallet"],
     ["pieces", "Pieces"],
     ["product", "Product"],
@@ -975,7 +1255,10 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
     ["docs", "Docs"],
     ["delete", "Delete"],
   ];
-  const sortable = new Set(["activity_date", "warehouse", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "repack"]);
+  const sortable = new Set(["activity_date", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "repack"]);
+  const warehouseOptions = isOwner
+    ? [{ id: ALL_WAREHOUSES, code: "", name: "All Warehouses" }, ...warehouses]
+    : warehouses;
 
   function toggleSort(key) {
     if (!sortable.has(key)) return;
@@ -996,9 +1279,18 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
   }
 
   return <>
-    <Header title="Activities" subtitle="Inbound, outbound, repack, notes, and documents per event." />
-    <div className="flex items-center gap-3 mb-4">
+    <Header title="Activities" />
+    <div className="grid grid-cols-[minmax(0,1fr)_220px_auto] items-end gap-3 mb-4">
       <div className="relative flex-1"><Search size={18} className="absolute left-3 top-3 text-slate-400" /><input className="w-full pl-10 pr-3 py-2 rounded-xl border bg-white" placeholder="Search activities..." value={query} onChange={(e) => setQuery(e.target.value)} /></div>
+      <Select
+        label="Warehouse"
+        value={activityWarehouse}
+        onChange={setActivityWarehouse}
+        options={warehouseOptions}
+        disabled={!isOwner}
+        getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+        getOptionValue={(warehouseRecord) => warehouseRecord.id}
+      />
       <Button onClick={addEvent} className="rounded-xl"><Plus size={16} className="mr-2" />Add Event</Button>
     </div>
 
@@ -1022,7 +1314,6 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" disabled={!isOwner} value={activity.warehouse_id || ""} displayValue={getActivityWarehouseName(activity)} options={warehouses.map((warehouseRecord) => ({ value: warehouseRecord.id, label: warehouseLabel(warehouseRecord) }))} onSave={(value) => updateActivity(activity.id, "warehouse_id", value)} {...editProps(activity.id, "warehouse_id")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
@@ -1125,14 +1416,54 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
   );
 }
 
-function InventoryView({ warehouse, rows }) {
+function InventoryView({ warehouse, rows, sort, setSort }) {
+  const columns = [
+    ["item", "Item"],
+    ["pallets", "Pallets"],
+    ["in_qty", "Pcs"],
+    ["reserved_qty", "Reserved"],
+    ["incoming_qty", "Incoming"],
+  ];
+
+  function toggleSort(key) {
+    setSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+    }));
+  }
+
   return <>
-    <Header title={`Inventory — ${warehouse}`} />
-    <Table headers={["Item", "Pallets", "Pcs", "Reserved", "Incoming"]} rows={rows.map((r) => [r.item, r.pallets, r.in_qty, r.reserved_qty, r.incoming_qty])} />
+    <Header title={`Inventory - ${warehouse}`} />
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-100 text-slate-600">
+          <tr>
+            {columns.map(([key, label]) => (
+              <th key={key} className="text-left px-4 py-3 font-semibold">
+                <button className="font-semibold hover:text-slate-900" onClick={() => toggleSort(key)}>
+                  {label}{sort.key === key ? sort.direction === "asc" ? " ↑" : " ↓" : ""}
+                </button>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={`${row.item}-${row.warehouse_id || row.warehouse || index}`} className="border-t hover:bg-slate-50">
+              <td className="px-4 py-3 align-top">{row.item}</td>
+              <td className="px-4 py-3 align-top">{Number(row.pallets) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.in_qty) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.reserved_qty) || 0}</td>
+              <td className="px-4 py-3 align-top">{Number(row.incoming_qty) || 0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   </>;
 }
 
-function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices }) {
+function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices, warehouses, isOwner, chargesWarehouse, setChargesWarehouse }) {
   const [editingRates, setEditingRates] = useState(false);
   const [rateDraft, setRateDraft] = useState({
     storageRate: charges.storageRate,
@@ -1147,8 +1478,17 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
 
   return <>
     <Header title={`Charges - ${month}`} subtitle="Storage, inbound handling, outbound handling, invoices, and charge details." />
-    <div className="mb-4 max-w-xs">
+    <div className="mb-4 grid max-w-xl grid-cols-2 gap-3">
       <Select label="Month" value={month} onChange={setMonth} options={months} />
+      <Select
+        label="Warehouse"
+        value={chargesWarehouse}
+        onChange={setChargesWarehouse}
+        options={isOwner ? [{ id: ALL_WAREHOUSES, name: "All Warehouses" }, ...warehouses] : warehouses}
+        disabled={!isOwner}
+        getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+        getOptionValue={(warehouseRecord) => warehouseRecord.id}
+      />
     </div>
     {loading && <div className="mb-4 rounded-xl border bg-white px-4 py-3 text-sm text-slate-500">Loading charges...</div>}
     <div className="grid grid-cols-4 gap-4 mb-6"><KPI label="Storage" value={money(charges.storageSubtotal)} /><KPI label="Inbound" value={money(charges.inboundSubtotal)} /><KPI label="Outbound" value={money(charges.outboundSubtotal)} /><KPI label="Total" value={money(charges.total)} /></div>
@@ -1167,14 +1507,14 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
           <Rate label="Storage" value={`${money(charges.storageRate)} / unit / week`} />
           <Rate label="Inbound" value={`${money(charges.inboundRate)} / HU`} />
           <Rate label="Outbound" value={`${money(charges.outboundRate)} / HU`} />
-          <Button variant="outline" className="mt-4 rounded-xl" onClick={() => {
+          {isOwner && <Button variant="outline" className="mt-4 rounded-xl" onClick={() => {
             setRateDraft({
               storageRate: charges.storageRate,
               inboundRate: charges.inboundRate,
               outboundRate: charges.outboundRate,
             });
             setEditingRates(true);
-          }}>Edit rates</Button>
+          }}>Edit rates</Button>}
         </>}
       </CardContent></Card>
       <Card className="rounded-2xl shadow-sm col-span-2"><CardContent className="p-5">
@@ -1225,7 +1565,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
         <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add</Button></div>
         <label className="inline-flex cursor-pointer items-end justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium transition hover:bg-slate-100">
           <Upload size={16} className="mr-2" />Import CSV
-          <input type="file" accept=".csv,text/csv" className="hidden" onChange={(event) => onImport(kind, event.target.files)} />
+          <input type="file" accept=".csv,text/csv" className="hidden" onChange={async (event) => { await onImport(kind, event.target.files); event.target.value = ""; }} />
         </label>
       </div>
     </CardContent></Card>
@@ -1318,17 +1658,103 @@ function WarehouseSettings({ warehouses, saveWarehouse }) {
   </>;
 }
 
-function SettingsView({ profiles }) {
+function SettingsView({ profiles, warehouses, onSave, onDeactivate }) {
+  const [newProfile, setNewProfile] = useState({ email: "", role: "warehouse", warehouse_id: warehouses[0]?.id || "", active: true });
+  const [editingRows, setEditingRows] = useState({});
+
+  function updateRow(profileRecord, patch) {
+    setEditingRows((current) => ({
+      ...current,
+      [profileRecord.id]: { ...profileRecord, ...(current[profileRecord.id] || {}), ...patch },
+    }));
+  }
+
+  async function saveNewProfile() {
+    await onSave(newProfile);
+    setNewProfile({ email: "", role: "warehouse", warehouse_id: warehouses[0]?.id || "", active: true });
+  }
+
   return <>
-    <Header title="Settings - Users" subtitle="Owner and warehouse-level user access." />
-    <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><Table headers={["User", "Role", "Access"]} rows={profiles.map((user) => [user.email, user.role, user.role === "owner" ? "All warehouses + charges + settings" : `${user.warehouse_name || user.warehouse} activities and inventory only`])} /></CardContent></Card>
+    <Header title="Settings - Users" subtitle="Configure Auth-backed profiles. New emails must already exist in Supabase Auth or be invited before they can be assigned here." />
+    <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
+      <div className="grid grid-cols-[minmax(0,1.5fr)_160px_minmax(0,1fr)_120px_auto] gap-3">
+        <Input label="Email" type="email" value={newProfile.email} onChange={(value) => setNewProfile({ ...newProfile, email: value })} />
+        <Select label="Role" value={newProfile.role} onChange={(value) => setNewProfile({ ...newProfile, role: value })} options={["owner", "admin", "warehouse"]} />
+        <Select
+          label="Warehouse"
+          value={newProfile.warehouse_id}
+          onChange={(value) => setNewProfile({ ...newProfile, warehouse_id: value })}
+          options={warehouses}
+          disabled={newProfile.role !== "warehouse"}
+          getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+          getOptionValue={(warehouseRecord) => warehouseRecord.id}
+        />
+        <Select label="Active" value={newProfile.active ? "true" : "false"} onChange={(value) => setNewProfile({ ...newProfile, active: value === "true" })} options={["true", "false"]} />
+        <div className="flex items-end"><Button onClick={saveNewProfile}>Save user</Button></div>
+      </div>
+    </CardContent></Card>
+
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-100 text-slate-600">
+          <tr>
+            <th className="text-left px-4 py-3 font-semibold">Email</th>
+            <th className="text-left px-4 py-3 font-semibold">Role</th>
+            <th className="text-left px-4 py-3 font-semibold">Warehouse</th>
+            <th className="text-left px-4 py-3 font-semibold">Active</th>
+            <th className="text-left px-4 py-3 font-semibold">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {profiles.map((profileRecord) => {
+            const draft = editingRows[profileRecord.id] || profileRecord;
+            return (
+              <tr key={profileRecord.id} className="border-t hover:bg-slate-50">
+                <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.email || ""} onChange={(event) => updateRow(profileRecord, { email: event.target.value })} /></td>
+                <td className="px-4 py-3"><Select label="" value={draft.role || "warehouse"} onChange={(value) => updateRow(profileRecord, { role: value })} options={["owner", "admin", "warehouse"]} /></td>
+                <td className="px-4 py-3">
+                  <Select
+                    label=""
+                    value={draft.warehouse_id || ""}
+                    onChange={(value) => updateRow(profileRecord, { warehouse_id: value })}
+                    options={warehouses}
+                    disabled={draft.role !== "warehouse"}
+                    getOptionLabel={(warehouseRecord) => warehouseRecord.name}
+                    getOptionValue={(warehouseRecord) => warehouseRecord.id}
+                  />
+                </td>
+                <td className="px-4 py-3"><Select label="" value={draft.active === false ? "false" : "true"} onChange={(value) => updateRow(profileRecord, { active: value === "true" })} options={["true", "false"]} /></td>
+                <td className="px-4 py-3">
+                  <div className="flex gap-2">
+                    <Button size="sm" onClick={() => onSave(draft)}>Save</Button>
+                    <Button size="sm" variant="ghost" onClick={() => onDeactivate(draft)}>Deactivate</Button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   </>;
 }
 
 function Header({ title, subtitle }) { return <div className="mb-6"><h1 className="text-3xl font-bold tracking-tight">{title}</h1>{subtitle && <p className="text-slate-500 mt-1">{subtitle}</p>}</div>; }
 function Rate({ label, value }) { return <div className="flex justify-between py-2 border-b"><span className="text-slate-500">{label}</span><span className="font-semibold">{value}</span></div>; }
 function Input({ label, value, onChange, type = "text" }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><input type={type} className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={value} onChange={(e) => onChange(e.target.value)} /></label>; }
-function Select({ label, value, onChange, options, disabled = false }) { return <label className="text-xs font-medium text-slate-500"><span>{label}</span><select className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm disabled:bg-slate-100" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>{options.map((o) => <option key={o}>{o}</option>)}</select></label>; }
+function Select({ label, value, onChange, options, disabled = false, getOptionLabel = (option) => option, getOptionValue = (option) => option }) {
+  return (
+    <label className="text-xs font-medium text-slate-500">
+      <span>{label}</span>
+      <select className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm disabled:bg-slate-100" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+        {options.map((option) => {
+          const optionValue = getOptionValue(option);
+          return <option key={optionValue} value={optionValue}>{getOptionLabel(option)}</option>;
+        })}
+      </select>
+    </label>
+  );
+}
 
 function DocUpload({ documents = [], uploading, onChange }) {
   return (
