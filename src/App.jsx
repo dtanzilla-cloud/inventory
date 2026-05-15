@@ -127,85 +127,41 @@ function canonicalWarehouseKey(row, warehouseRecords = []) {
   return matchedWarehouse?.id || row?.warehouse_id || row?.warehouse || row?.warehouse_name || row?.warehouse_code || "";
 }
 
-function addPalletBalance(balances, item, warehouseKey, movement) {
-  if (!item || !warehouseKey) return;
-  const key = inventoryKey(item, warehouseKey);
-  balances.set(key, (balances.get(key) || 0) + movement);
-}
-
-function addInventoryRow(grouped, row, groupMode) {
-  const item = row.item || row.product;
-  if (!item) return;
-
-  const key = groupMode === "all" ? item : inventoryKey(item, row.warehouse_id || row.warehouse);
-  const current = grouped.get(key) || {
-    item,
-    warehouse_id: groupMode === "all" ? "" : row.warehouse_id || "",
-    warehouse: groupMode === "all" ? ALL_WAREHOUSES : row.warehouse || "",
-    pallets: 0,
-    in_qty: 0,
-    reserved_qty: 0,
-    incoming_qty: 0,
-  };
-
-  current.pallets += Number(row.pallets) || 0;
-  current.in_qty += Number(row.in_qty) || 0;
-  current.reserved_qty += Number(row.reserved_qty) || 0;
-  current.incoming_qty += Number(row.incoming_qty) || 0;
-  grouped.set(key, current);
-}
-
-function derivePalletRows(activities, warehouseRecords = []) {
+function deriveInventoryRowsFromActivities({ activities, warehouseFilter, warehouseRecords = [] }) {
   const today = new Date().toISOString().slice(0, 10);
-
-  return activities.reduce((balances, activity) => {
-    if (!activity.product || !activity.activity_date || activity.activity_date >= today) {
-      return balances;
-    }
-
-    const movement = signedActivityUnits(activity);
-    addPalletBalance(balances, activity.product, canonicalWarehouseKey(activity, warehouseRecords), movement);
-    return balances;
-  }, new Map());
-}
-
-function buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter, warehouseRecords = [] }) {
   const groupMode = warehouseFilter === ALL_WAREHOUSES ? "all" : "warehouse";
   const grouped = new Map();
-  const palletRows = derivePalletRows(activities, warehouseRecords);
 
-  palletRows.forEach((pallets, key) => {
-    const [item, warehouseKey] = key.split("::");
+  activities.forEach((activity) => {
+    if (!activity.product || !activity.activity_date || !rowMatchesWarehouse(activity, warehouseFilter, warehouseRecords)) {
+      return;
+    }
+
+    const item = activity.product;
+    const warehouseKey = canonicalWarehouseKey(activity, warehouseRecords);
     const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
-    const row = {
+    const groupKey = groupMode === "all" ? item : inventoryKey(item, warehouseKey);
+    const current = grouped.get(groupKey) || {
       item,
-      warehouse_id: matchedWarehouse?.id || warehouseKey,
-      warehouse: matchedWarehouse?.name || warehouseKey,
-      pallets,
+      warehouse_id: groupMode === "all" ? "" : matchedWarehouse?.id || activity.warehouse_id || "",
+      warehouse: groupMode === "all" ? ALL_WAREHOUSES : matchedWarehouse?.name || activity.warehouse || warehouseKey,
+      pallets: 0,
       in_qty: 0,
       reserved_qty: 0,
       incoming_qty: 0,
     };
+    const pieces = Number(activity.pieces) || 0;
 
-    if (rowMatchesWarehouse(row, warehouseFilter, warehouseRecords)) addInventoryRow(grouped, row, groupMode);
-  });
+    if (activity.activity_date < today) {
+      current.pallets += signedActivityUnits(activity);
+      current.in_qty += pieces;
+    } else if (pieces < 0) {
+      current.reserved_qty += Math.abs(pieces);
+    } else if (pieces > 0) {
+      current.incoming_qty += pieces;
+    }
 
-  inventoryLedger.forEach((ledgerRow) => {
-    if (!rowMatchesWarehouse(ledgerRow, warehouseFilter, warehouseRecords)) return;
-
-    const warehouseKey = canonicalWarehouseKey(ledgerRow, warehouseRecords);
-    const matchedWarehouse = warehouseRecordForFilter(warehouseKey, warehouseRecords);
-    const row = {
-      item: ledgerRow.item,
-      warehouse_id: matchedWarehouse?.id || ledgerRow.warehouse_id || warehouseKey,
-      warehouse: matchedWarehouse?.name || ledgerRow.warehouse || warehouseKey,
-      pallets: 0,
-      in_qty: ledgerRow.in_qty,
-      reserved_qty: ledgerRow.reserved_qty,
-      incoming_qty: ledgerRow.incoming_qty,
-    };
-
-    addInventoryRow(grouped, row, groupMode);
+    grouped.set(groupKey, current);
   });
 
   return Array.from(grouped.values());
@@ -367,7 +323,6 @@ export default function InventoryManagementSystem() {
   const [chargesWarehouse, setChargesWarehouse] = useState(ALL_WAREHOUSES);
   const [warehouses, setWarehouses] = useState([DEFAULT_WAREHOUSE]);
   const [activities, setActivities] = useState([]);
-  const [inventoryLedger, setInventoryLedger] = useState([]);
   const [products, setProducts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -403,7 +358,6 @@ export default function InventoryManagementSystem() {
       if (!nextSession) {
         setProfile(null);
         setActivities([]);
-        setInventoryLedger([]);
         setProducts([]);
         setCustomers([]);
         setSuppliers([]);
@@ -432,7 +386,6 @@ export default function InventoryManagementSystem() {
     if (isOwner) {
       loadProfiles();
     }
-    loadInventoryLedger(profile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
@@ -599,35 +552,6 @@ export default function InventoryManagementSystem() {
     setLoading(false);
   }
 
-  async function loadInventoryLedger(activeProfile = profile) {
-    if (!activeProfile) return;
-
-    let ledgerQuery = supabase
-      .from("inventory_ledger")
-      .select("*")
-      .order("warehouse", { ascending: true })
-      .order("item", { ascending: true });
-
-    if (activeProfile.role === "warehouse") {
-      if (activeProfile.warehouse_id) {
-        ledgerQuery = ledgerQuery.eq("warehouse_id", activeProfile.warehouse_id);
-      } else {
-        ledgerQuery = ledgerQuery.eq("warehouse", activeProfile.warehouse_name || activeProfile.warehouse);
-      }
-    }
-
-    const { data, error } = await ledgerQuery;
-
-    if (error) {
-      console.error(error);
-      setErrorMessage("Inventory could not be loaded from Supabase.");
-      setInventoryLedger([]);
-      return;
-    }
-
-    setInventoryLedger(data || []);
-  }
-
   async function loadCharges() {
     setChargesLoading(true);
 
@@ -689,8 +613,8 @@ export default function InventoryManagementSystem() {
   }, [activitySort, visibleActivities]);
 
   const visibleInventory = useMemo(
-    () => buildDedupedInventoryRows({ activities, inventoryLedger, warehouseFilter: warehouse, warehouseRecords: warehouses }),
-    [activities, inventoryLedger, warehouse, warehouses],
+    () => deriveInventoryRowsFromActivities({ activities, warehouseFilter: warehouse, warehouseRecords: warehouses }),
+    [activities, warehouse, warehouses],
   );
   const sortedInventory = useMemo(() => {
     const direction = inventorySort.direction === "asc" ? 1 : -1;
@@ -758,7 +682,6 @@ export default function InventoryManagementSystem() {
     setActivitySort({ key: "activity_date", direction: "desc" });
     setActivities((current) => [normalizeActivity(data), ...current]);
     setEditingCell({ activityId: data.id, field: "product" });
-    await loadInventoryLedger();
   }
 
   async function updateActivity(activityId, field, value) {
@@ -794,9 +717,7 @@ export default function InventoryManagementSystem() {
     );
     setSuccessMessage("Activity saved.");
 
-    if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) {
-      await loadInventoryLedger();
-    }
+    if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) setSuccessMessage("Activity saved. Inventory refreshed.");
   }
 
   async function deleteActivity(id) {
@@ -811,7 +732,6 @@ export default function InventoryManagementSystem() {
     }
 
     setActivities((current) => current.filter((activity) => activity.id !== id));
-    await loadInventoryLedger();
   }
 
   async function uploadDocuments(activityId, fileList) {
@@ -1068,7 +988,6 @@ export default function InventoryManagementSystem() {
 
     await loadWarehouses(profile);
     await loadActivities(profile);
-    await loadInventoryLedger(profile);
   }
 
   async function saveProfile(profileRecord) {
