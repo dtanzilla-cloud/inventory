@@ -47,6 +47,25 @@ function shortDate(dateValue) {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function dateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function addDays(date, days) {
+  const nextDate = new Date(date);
+  nextDate.setDate(nextDate.getDate() + days);
+  return nextDate;
+}
+
+function startOfWeek(date) {
+  return addDays(date, -date.getDay());
+}
+
+function billingMonthStart(monthKey) {
+  const [year, month] = monthKey.split("-").map(Number);
+  return startOfWeek(new Date(year, month - 1, 1));
+}
+
 function slugify(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
@@ -169,13 +188,13 @@ function deriveInventoryRowsFromActivities({ activities, warehouseFilter, wareho
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
   const [year, month] = monthKey.split("-").map(Number);
-  const lastDay = new Date(year, month, 0).getDate();
+  const billingStart = billingMonthStart(monthKey);
+  const nextBillingStart = billingMonthStart(`${month === 12 ? year + 1 : year}-${String(month === 12 ? 1 : month + 1).padStart(2, "0")}`);
   const rows = [];
 
-  for (let start = 1; start <= lastDay; start += 7) {
-    const end = Math.min(start + 6, lastDay);
-    const startDate = `${monthKey}-${String(start).padStart(2, "0")}`;
-    const endDate = `${monthKey}-${String(end).padStart(2, "0")}`;
+  for (let weekStart = billingStart; weekStart < nextBillingStart; weekStart = addDays(weekStart, 7)) {
+    const startDate = dateKey(weekStart);
+    const endDate = dateKey(addDays(weekStart, 6));
     const units = activities
       .filter((activity) => activity.activity_date < startDate)
       .reduce((sum, activity) => sum + signedActivityUnits(activity), 0);
@@ -183,7 +202,7 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
 
     rows.push([
       rows.length + 1,
-      `${shortDate(`${monthKey}-${String(start).padStart(2, "0")}`)} - ${shortDate(endDate)}`,
+      `${shortDate(startDate)} - ${shortDate(endDate)}`,
       unitsOnHand,
       storageRate,
       unitsOnHand * storageRate,
