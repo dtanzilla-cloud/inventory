@@ -308,6 +308,41 @@ function parseCsvNames(text, hasSku = false) {
   }, []);
 }
 
+function parseCsvRecords(text) {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const [headerLine] = lines;
+  const headers = parseCsvLine(headerLine || "").map((value) => value.trim().toLowerCase());
+
+  return lines.slice(1).map((line, index) => {
+    const values = parseCsvLine(line);
+    return {
+      rowNumber: index + 2,
+      data: headers.reduce((row, header, valueIndex) => {
+        row[header] = values[valueIndex]?.trim() || "";
+        return row;
+      }, {}),
+    };
+  });
+}
+
+function normalizeLookup(value) {
+  return (value || "").trim().toLowerCase();
+}
+
+function parseOptionalNumber(value) {
+  if (value === "") return 0;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseRepack(value) {
+  const normalized = normalizeLookup(value);
+  if (!normalized) return "";
+  if (["y", "yes", "true"].includes(normalized)) return "Y";
+  if (["n", "no", "false"].includes(normalized)) return "N";
+  return null;
+}
+
 function optionNames(records, rawValue) {
   const names = records.filter((record) => record.active !== false).map((record) => record.name);
   return rawValue && !names.includes(rawValue) ? [rawValue, ...names] : names;
@@ -336,6 +371,7 @@ export default function InventoryManagementSystem() {
   const [chargesLoading, setChargesLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
+  const [importingActivities, setImportingActivities] = useState(false);
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
   const [editingCell, setEditingCell] = useState(null);
@@ -734,6 +770,125 @@ export default function InventoryManagementSystem() {
     setActivities((current) => current.filter((activity) => activity.id !== id));
   }
 
+  async function ensureMasterDataForImport(kind, names, existingRecords) {
+    const config = masterDataConfig[kind];
+    const existingNames = new Set(existingRecords.map((record) => normalizeLookup(record.name)));
+    const rows = Array.from(names)
+      .filter((name) => name && !existingNames.has(normalizeLookup(name)))
+      .map((name) => config.hasSku ? { name, sku: null, active: true } : { name, active: true });
+
+    if (rows.length === 0) return;
+    if (!isOwner) {
+      throw new Error(`Missing ${kind.toLowerCase()} master data: ${rows.map((row) => row.name).join(", ")}`);
+    }
+
+    const { error } = await supabase
+      .from(config.table)
+      .upsert(rows, { onConflict: "name", ignoreDuplicates: true });
+
+    if (error) throw error;
+  }
+
+  async function importActivitiesCsv(fileList) {
+    const [file] = Array.from(fileList || []);
+    if (!file || !profile) return;
+
+    setErrorMessage("");
+    setSuccessMessage("");
+    setImportingActivities(true);
+
+    try {
+      const text = await file.text();
+      const rows = parseCsvRecords(text);
+      const errors = [];
+      const payloads = [];
+      const productNames = new Set();
+      const customerNames = new Set();
+      const supplierNames = new Set();
+
+      rows.forEach(({ rowNumber, data }) => {
+        const activityDate = data.activity_date;
+        const product = data.product?.trim() || "";
+        const customer = data.customer?.trim() || "";
+        const supplier = data.supplier?.trim() || "";
+        const pallets = parseOptionalNumber(data.pallets || "");
+        const pieces = parseOptionalNumber(data.pieces || "");
+        const repack = parseRepack(data.repack || "");
+        const warehouseCode = data.warehouse_code?.trim() || "";
+        const selectedWarehouse =
+          warehouseCode
+            ? warehouses.find((warehouseRecord) => normalizeLookup(warehouseRecord.code) === normalizeLookup(warehouseCode))
+            : warehouseRecordForFilter(activityWarehouse, warehouses) || defaultWarehouse;
+
+        if (!activityDate) errors.push(`Row ${rowNumber}: activity_date is required.`);
+        if (!product) errors.push(`Row ${rowNumber}: product is required.`);
+        if (pallets === null) errors.push(`Row ${rowNumber}: pallets must be a number.`);
+        if (pieces === null) errors.push(`Row ${rowNumber}: pieces must be a number.`);
+        if (repack === null) errors.push(`Row ${rowNumber}: repack must be Y/N, Yes/No, true/false, or blank.`);
+        const assignedWarehouseFilter = profile.warehouse_id || profile.warehouse_name || profile.warehouse;
+        const canImportWarehouse =
+          profile.role !== "warehouse" ||
+          (selectedWarehouse?.id && selectedWarehouse.id === profile.warehouse_id) ||
+          rowMatchesWarehouse(selectedWarehouse, assignedWarehouseFilter, warehouses);
+
+        if (!selectedWarehouse) errors.push(`Row ${rowNumber}: warehouse_code "${warehouseCode}" was not found.`);
+        if (profile.role === "warehouse" && !canImportWarehouse) {
+          errors.push(`Row ${rowNumber}: warehouse users can import only into their assigned warehouse.`);
+        }
+
+        const rowHasErrors = errors.some((error) => error.startsWith(`Row ${rowNumber}:`));
+        if (rowHasErrors) return;
+
+        productNames.add(product);
+        if (customer) customerNames.add(customer);
+        if (supplier) supplierNames.add(supplier);
+        payloads.push({
+          activity_date: activityDate,
+          warehouse_id: selectedWarehouse.id || null,
+          warehouse: warehouseName(selectedWarehouse),
+          pallets,
+          pieces,
+          product,
+          customer,
+          lot_number: data.lot_number || "",
+          supplier,
+          repack,
+          note: data.note || "",
+        });
+      });
+
+      await ensureMasterDataForImport("Products", productNames, products);
+      await ensureMasterDataForImport("Customers", customerNames, customers);
+      await ensureMasterDataForImport("Suppliers", supplierNames, suppliers);
+
+      let insertedActivities = [];
+      if (payloads.length > 0) {
+        const { data, error } = await supabase
+          .from("activities")
+          .insert(payloads)
+          .select("*, warehouses:warehouse_id(id, code, name)");
+
+        if (error) throw error;
+        insertedActivities = (data || []).map(normalizeActivity);
+      }
+
+      if (insertedActivities.length > 0) {
+        setActivities((current) => [...insertedActivities, ...current]);
+        setActivitySort({ key: "activity_date", direction: "desc" });
+      }
+      await loadMasterData();
+
+      const skipped = rows.length - insertedActivities.length;
+      setSuccessMessage(`Imported ${insertedActivities.length} activities. Skipped ${skipped} rows.`);
+      setErrorMessage(errors.length ? `Skipped rows:\n${errors.join("\n")}` : "");
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(`Activities CSV import failed: ${error.message}`);
+    } finally {
+      setImportingActivities(false);
+    }
+  }
+
   async function uploadDocuments(activityId, fileList) {
     const files = Array.from(fileList || []);
     if (!activityId || files.length === 0) return;
@@ -1097,9 +1252,9 @@ export default function InventoryManagementSystem() {
 
         <main className="flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
-            {errorMessage && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
+            {errorMessage && <div className="mb-4 whitespace-pre-line rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
+            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
             {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
@@ -1160,7 +1315,7 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }) {
+function ActivitiesView({ activities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }) {
   const columns = [
     ["activity_date", "Date"],
     ["pallets", "Pallet"],
@@ -1199,7 +1354,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
 
   return <>
     <Header title="Activities" />
-    <div className="grid grid-cols-[minmax(0,1fr)_220px_auto] items-end gap-3 mb-4">
+    <div className="grid grid-cols-[minmax(0,1fr)_220px_auto_auto] items-end gap-3 mb-4">
       <div className="relative flex-1"><Search size={18} className="absolute left-3 top-3 text-slate-400" /><input className="w-full pl-10 pr-3 py-2 rounded-xl border bg-white" placeholder="Search activities..." value={query} onChange={(e) => setQuery(e.target.value)} /></div>
       <Select
         label="Warehouse"
@@ -1210,6 +1365,10 @@ function ActivitiesView({ activities, query, setQuery, addEvent, updateActivity,
         getOptionLabel={(warehouseRecord) => warehouseRecord.name}
         getOptionValue={(warehouseRecord) => warehouseRecord.id}
       />
+      <label className={`inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium transition hover:bg-slate-100 ${importingActivities ? "cursor-wait opacity-60" : "cursor-pointer"}`}>
+        <Upload size={16} className="mr-2" />{importingActivities ? "Importing" : "Import Activities CSV"}
+        <input type="file" accept=".csv,text/csv" className="hidden" disabled={importingActivities} onChange={(event) => { importActivitiesCsv(event.target.files); event.target.value = ""; }} />
+      </label>
       <Button onClick={addEvent} className="rounded-xl"><Plus size={16} className="mr-2" />Add Event</Button>
     </div>
 
