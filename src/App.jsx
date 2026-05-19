@@ -791,10 +791,24 @@ export default function InventoryManagementSystem() {
 
   async function ensureMasterDataForImport(kind, names, existingRecords) {
     const config = masterDataConfig[kind];
-    const existingNames = new Set(existingRecords.map((record) => normalizeLookup(record.name)));
-    const rows = Array.from(names)
-      .filter((name) => name && !existingNames.has(normalizeLookup(name)))
-      .map((name) => config.hasSku ? { name, sku: null, active: true } : { name, active: true });
+    const { data, error: loadError } = await supabase
+      .from(config.table)
+      .select("name");
+
+    if (loadError) throw loadError;
+
+    const existingNames = new Set([
+      ...existingRecords.map((record) => normalizeLookup(record.name)),
+      ...(data || []).map((record) => normalizeLookup(record.name)),
+    ]);
+    const rows = Array.from(names).reduce((missingRows, name) => {
+      const normalizedName = normalizeLookup(name);
+      if (!name || existingNames.has(normalizedName)) return missingRows;
+
+      existingNames.add(normalizedName);
+      missingRows.push(config.hasSku ? { name, sku: null, active: true } : { name, active: true });
+      return missingRows;
+    }, []);
 
     if (rows.length === 0) return;
     if (!isOwner) {
@@ -803,7 +817,7 @@ export default function InventoryManagementSystem() {
 
     const { error } = await supabase
       .from(config.table)
-      .upsert(rows, { onConflict: "name", ignoreDuplicates: true });
+      .insert(rows);
 
     if (error) throw error;
   }
