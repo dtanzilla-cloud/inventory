@@ -795,7 +795,7 @@ export default function InventoryManagementSystem() {
       .from(config.table)
       .select("name");
 
-    if (loadError) throw loadError;
+    if (loadError) throw new Error(`loading ${kind.toLowerCase()} master data failed: ${loadError.message}`);
 
     const existingNames = new Set([
       ...existingRecords.map((record) => normalizeLookup(record.name)),
@@ -819,7 +819,7 @@ export default function InventoryManagementSystem() {
       .from(config.table)
       .insert(rows);
 
-    if (error) throw error;
+    if (error) throw new Error(`inserting ${kind.toLowerCase()} master data failed: ${error.message}`);
     return rows.length;
   }
 
@@ -902,7 +902,7 @@ export default function InventoryManagementSystem() {
           .insert(payloads)
           .select("*, warehouses:warehouse_id(id, code, name)");
 
-        if (error) throw error;
+        if (error) throw new Error(`inserting activities failed: ${error.message}`);
         insertedActivities = (data || []).map(normalizeActivity);
       }
 
@@ -988,15 +988,29 @@ export default function InventoryManagementSystem() {
       outbound_rate: Number(nextRates.outboundRate),
     };
 
-    const { data, error } = await supabase
+    const { data: existingRate, error: findError } = await supabase
       .from("billing_rates")
-      .upsert(payload, { onConflict: "month" })
+      .select("month")
+      .eq("month", targetMonth)
+      .maybeSingle();
+
+    if (findError) {
+      console.error(findError);
+      setErrorMessage(`Billing rates lookup failed: ${findError.message}`);
+      return;
+    }
+
+    const request = existingRate
+      ? supabase.from("billing_rates").update(payload).eq("month", targetMonth)
+      : supabase.from("billing_rates").insert([payload]);
+
+    const { data, error } = await request
       .select("month, storage_rate, inbound_rate, outbound_rate")
       .single();
 
     if (error) {
       console.error(error);
-      setErrorMessage("Billing rates could not be saved.");
+      setErrorMessage(`Billing rates could not be saved: ${error.message}`);
       return;
     }
 
@@ -1132,8 +1146,8 @@ export default function InventoryManagementSystem() {
       return;
     }
 
-    const existingNames = new Set((existingRecords || []).map((record) => record.name?.trim().toLowerCase()).filter(Boolean));
-    const rowsToInsert = rows.filter((row) => !existingNames.has(row.name.toLowerCase()));
+    const existingNames = new Set((existingRecords || []).map((record) => normalizeLookup(record.name)).filter(Boolean));
+    const rowsToInsert = rows.filter((row) => !existingNames.has(normalizeLookup(row.name)));
     const skippedCount = rows.length - rowsToInsert.length;
 
     if (rowsToInsert.length === 0) {
