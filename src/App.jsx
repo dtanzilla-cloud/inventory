@@ -27,7 +27,7 @@ function money(n) {
 }
 
 function toMonthKey(dateValue) {
-  return (dateValue || "").slice(0, 7);
+  return normalizeDateKey(dateValue).slice(0, 7);
 }
 
 function monthLabelFromKey(monthKey) {
@@ -49,6 +49,18 @@ function shortDate(dateValue) {
 
 function dateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function normalizeDateKey(dateValue) {
+  if (!dateValue) return "";
+  if (dateValue instanceof Date) return dateKey(dateValue);
+
+  const stringValue = String(dateValue).trim();
+  const dateMatch = stringValue.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (dateMatch) return `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+
+  const parsedDate = new Date(stringValue);
+  return Number.isNaN(parsedDate.getTime()) ? "" : dateKey(parsedDate);
 }
 
 function addDays(date, days) {
@@ -152,7 +164,8 @@ function deriveInventoryRowsFromActivities({ activities, warehouseFilter, wareho
   const grouped = new Map();
 
   activities.forEach((activity) => {
-    if (!activity.product || !activity.activity_date || !rowMatchesWarehouse(activity, warehouseFilter, warehouseRecords)) {
+    const activityDate = normalizeDateKey(activity.activity_date);
+    if (!activity.product || !activityDate || !rowMatchesWarehouse(activity, warehouseFilter, warehouseRecords)) {
       return;
     }
 
@@ -171,7 +184,7 @@ function deriveInventoryRowsFromActivities({ activities, warehouseFilter, wareho
     };
     const pieces = Number(activity.pieces) || 0;
 
-    if (activity.activity_date < today) {
+    if (activityDate <= today) {
       current.pallets += signedActivityUnits(activity);
       current.in_qty += pieces;
     } else if (pieces < 0) {
@@ -196,7 +209,7 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
     const startDate = dateKey(weekStart);
     const endDate = dateKey(addDays(weekStart, 6));
     const units = activities
-      .filter((activity) => activity.activity_date < startDate)
+      .filter((activity) => normalizeDateKey(activity.activity_date) < startDate)
       .reduce((sum, activity) => sum + signedActivityUnits(activity), 0);
     const unitsOnHand = Math.max(0, units);
 
@@ -259,7 +272,7 @@ function filterRowsByWarehouse(rows, warehouseFilter, warehouseRecords = []) {
 function normalizeActivity(activity) {
   return {
     ...activity,
-    activity_date: activity.activity_date || activity.date || "",
+    activity_date: normalizeDateKey(activity.activity_date || activity.date),
     documents: Array.isArray(activity.documents) ? activity.documents : [],
     warehouse_id: activity.warehouse_id || "",
     warehouse_name: activity.warehouses?.name || activity.warehouse || "",
