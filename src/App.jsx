@@ -791,21 +791,36 @@ export default function InventoryManagementSystem() {
 
   async function ensureMasterDataForImport(kind, names, existingRecords) {
     const config = masterDataConfig[kind];
-    const existingNames = new Set(existingRecords.map((record) => normalizeLookup(record.name)));
-    const rows = Array.from(names)
-      .filter((name) => name && !existingNames.has(normalizeLookup(name)))
-      .map((name) => config.hasSku ? { name, sku: null, active: true } : { name, active: true });
+    const { data, error: loadError } = await supabase
+      .from(config.table)
+      .select("name");
 
-    if (rows.length === 0) return;
+    if (loadError) throw new Error(`loading ${kind.toLowerCase()} master data failed: ${loadError.message}`);
+
+    const existingNames = new Set([
+      ...existingRecords.map((record) => normalizeLookup(record.name)),
+      ...(data || []).map((record) => normalizeLookup(record.name)),
+    ]);
+    const rows = Array.from(names).reduce((missingRows, name) => {
+      const normalizedName = normalizeLookup(name);
+      if (!name || existingNames.has(normalizedName)) return missingRows;
+
+      existingNames.add(normalizedName);
+      missingRows.push(config.hasSku ? { name, sku: null, active: true } : { name, active: true });
+      return missingRows;
+    }, []);
+
+    if (rows.length === 0) return 0;
     if (!isOwner) {
       throw new Error(`Missing ${kind.toLowerCase()} master data: ${rows.map((row) => row.name).join(", ")}`);
     }
 
     const { error } = await supabase
       .from(config.table)
-      .upsert(rows, { onConflict: "name", ignoreDuplicates: true });
+      .insert(rows);
 
-    if (error) throw error;
+    if (error) throw new Error(`inserting ${kind.toLowerCase()} master data failed: ${error.message}`);
+    return rows.length;
   }
 
   async function importActivitiesCsv(fileList) {
@@ -876,9 +891,9 @@ export default function InventoryManagementSystem() {
         });
       });
 
-      await ensureMasterDataForImport("Products", productNames, products);
-      await ensureMasterDataForImport("Customers", customerNames, customers);
-      await ensureMasterDataForImport("Suppliers", supplierNames, suppliers);
+      const addedProducts = await ensureMasterDataForImport("Products", productNames, products);
+      const addedCustomers = await ensureMasterDataForImport("Customers", customerNames, customers);
+      const addedSuppliers = await ensureMasterDataForImport("Suppliers", supplierNames, suppliers);
 
       let insertedActivities = [];
       if (payloads.length > 0) {
@@ -887,7 +902,7 @@ export default function InventoryManagementSystem() {
           .insert(payloads)
           .select("*, warehouses:warehouse_id(id, code, name)");
 
-        if (error) throw error;
+        if (error) throw new Error(`inserting activities failed: ${error.message}`);
         insertedActivities = (data || []).map(normalizeActivity);
       }
 
@@ -898,7 +913,7 @@ export default function InventoryManagementSystem() {
       await loadMasterData();
 
       const skipped = rows.length - insertedActivities.length;
-      setSuccessMessage(`Imported ${insertedActivities.length} activities. Skipped ${skipped} rows.`);
+      setSuccessMessage(`Imported ${insertedActivities.length} activities. Added ${addedProducts} products, ${addedCustomers} customers, ${addedSuppliers} suppliers. Skipped ${skipped} rows.`);
       setErrorMessage(errors.length ? `Skipped rows:\n${errors.join("\n")}` : "");
     } catch (error) {
       console.error(error);
@@ -973,15 +988,29 @@ export default function InventoryManagementSystem() {
       outbound_rate: Number(nextRates.outboundRate),
     };
 
-    const { data, error } = await supabase
+    const { data: existingRate, error: findError } = await supabase
       .from("billing_rates")
-      .upsert(payload, { onConflict: "month" })
+      .select("month")
+      .eq("month", targetMonth)
+      .maybeSingle();
+
+    if (findError) {
+      console.error(findError);
+      setErrorMessage(`Billing rates lookup failed: ${findError.message}`);
+      return;
+    }
+
+    const request = existingRate
+      ? supabase.from("billing_rates").update(payload).eq("month", targetMonth)
+      : supabase.from("billing_rates").insert([payload]);
+
+    const { data, error } = await request
       .select("month, storage_rate, inbound_rate, outbound_rate")
       .single();
 
     if (error) {
       console.error(error);
-      setErrorMessage("Billing rates could not be saved.");
+      setErrorMessage(`Billing rates could not be saved: ${error.message}`);
       return;
     }
 
