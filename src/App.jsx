@@ -810,7 +810,7 @@ export default function InventoryManagementSystem() {
       return missingRows;
     }, []);
 
-    if (rows.length === 0) return;
+    if (rows.length === 0) return 0;
     if (!isOwner) {
       throw new Error(`Missing ${kind.toLowerCase()} master data: ${rows.map((row) => row.name).join(", ")}`);
     }
@@ -820,6 +820,7 @@ export default function InventoryManagementSystem() {
       .insert(rows);
 
     if (error) throw error;
+    return rows.length;
   }
 
   async function importActivitiesCsv(fileList) {
@@ -890,9 +891,9 @@ export default function InventoryManagementSystem() {
         });
       });
 
-      await ensureMasterDataForImport("Products", productNames, products);
-      await ensureMasterDataForImport("Customers", customerNames, customers);
-      await ensureMasterDataForImport("Suppliers", supplierNames, suppliers);
+      const addedProducts = await ensureMasterDataForImport("Products", productNames, products);
+      const addedCustomers = await ensureMasterDataForImport("Customers", customerNames, customers);
+      const addedSuppliers = await ensureMasterDataForImport("Suppliers", supplierNames, suppliers);
 
       let insertedActivities = [];
       if (payloads.length > 0) {
@@ -912,7 +913,7 @@ export default function InventoryManagementSystem() {
       await loadMasterData();
 
       const skipped = rows.length - insertedActivities.length;
-      setSuccessMessage(`Imported ${insertedActivities.length} activities. Skipped ${skipped} rows.`);
+      setSuccessMessage(`Imported ${insertedActivities.length} activities. Added ${addedProducts} products, ${addedCustomers} customers, ${addedSuppliers} suppliers. Skipped ${skipped} rows.`);
       setErrorMessage(errors.length ? `Skipped rows:\n${errors.join("\n")}` : "");
     } catch (error) {
       console.error(error);
