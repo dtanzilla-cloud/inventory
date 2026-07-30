@@ -47,6 +47,13 @@ function shortDate(dateValue) {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function formatDateDisplay(dateValue) {
+  const key = normalizeDateKey(dateValue);
+  if (!key) return "";
+  const [year, month, day] = key.split("-");
+  return `${month}/${day}/${year}`;
+}
+
 function dateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
@@ -1423,7 +1430,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
           <tbody>
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} displayValue={formatDateDisplay(activity.activity_date)} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
