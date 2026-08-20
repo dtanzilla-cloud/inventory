@@ -450,7 +450,7 @@ export default function InventoryManagementSystem() {
     if (!session?.user) return;
     loadProfile(session.user);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
+  }, [session?.user?.id]);
 
   useEffect(() => {
     if (!profile) return;
@@ -462,7 +462,7 @@ export default function InventoryManagementSystem() {
       loadProfiles();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile]);
+  }, [profile?.id]);
 
   async function loadProfile(user) {
     setErrorMessage("");
