@@ -1059,13 +1059,17 @@ export default function InventoryManagementSystem() {
     }
   }
 
+  function masterRecordPayload(kind, record) {
+    return masterDataConfig[kind].hasSku
+      ? { name: record.name, pack_size: record.pack_size === "" || record.pack_size == null ? null : Number(record.pack_size), sku: record.sku || null, active: record.active !== false }
+      : { name: record.name, active: record.active !== false };
+  }
+
   async function saveMasterRecord(kind, record) {
     const config = masterDataConfig[kind];
     setErrorMessage("");
     setSuccessMessage("");
-    const payload = config.hasSku
-      ? { name: record.name, pack_size: record.pack_size === "" || record.pack_size == null ? null : Number(record.pack_size), sku: record.sku || null, active: record.active !== false }
-      : { name: record.name, active: record.active !== false };
+    const payload = masterRecordPayload(kind, record);
 
     const query = record.id
       ? supabase.from(config.table).update(payload).eq("id", record.id)
@@ -1082,33 +1086,82 @@ export default function InventoryManagementSystem() {
     setSuccessMessage(`${kind} saved.`);
   }
 
-  async function deleteMasterRecord(kind, record) {
+  async function saveMasterRecords(kind, records) {
     const config = masterDataConfig[kind];
-    const { count, error: countError } = await supabase
-      .from("activities")
-      .select("id", { count: "exact", head: true })
-      .eq(config.activityField, record.name);
+    setErrorMessage("");
+    setSuccessMessage("");
+    const failures = [];
 
-    if (countError) {
-      console.error(countError);
-      setErrorMessage(`${kind} safety check failed.`);
-      return;
+    for (const record of records) {
+      const { error } = await supabase.from(config.table).update(masterRecordPayload(kind, record)).eq("id", record.id);
+      if (error) {
+        console.error(error);
+        failures.push(`${record.name}: ${error.message}`);
+      }
     }
 
-    if (count > 0) {
-      setErrorMessage(`${record.name} is used by existing activities and cannot be deleted.`);
-      return;
+    await loadMasterData();
+    const savedCount = records.length - failures.length;
+    if (savedCount > 0) setSuccessMessage(`${savedCount} ${kind.toLowerCase()} saved.`);
+    if (failures.length > 0) setErrorMessage(`${kind} could not be saved:\n${failures.join("\n")}`);
+    return failures.length === 0;
+  }
+
+  async function deleteMasterRecords(kind, records) {
+    const config = masterDataConfig[kind];
+    setErrorMessage("");
+    setSuccessMessage("");
+    const deletableIds = [];
+    const blockedNames = [];
+
+    for (const record of records) {
+      const { count, error: countError } = await supabase
+        .from("activities")
+        .select("id", { count: "exact", head: true })
+        .eq(config.activityField, record.name);
+
+      if (countError) {
+        console.error(countError);
+        setErrorMessage(`${kind} safety check failed.`);
+        return false;
+      }
+
+      if (count > 0) blockedNames.push(record.name);
+      else deletableIds.push(record.id);
     }
 
-    const { error } = await supabase.from(config.table).delete().eq("id", record.id);
+    if (deletableIds.length > 0) {
+      const { error } = await supabase.from(config.table).delete().in("id", deletableIds);
+
+      if (error) {
+        console.error(error);
+        setErrorMessage(`${kind} could not be deleted.`);
+        return false;
+      }
+
+      await loadMasterData();
+      setSuccessMessage(`${deletableIds.length} ${kind.toLowerCase()} deleted.`);
+    }
+
+    if (blockedNames.length > 0) {
+      setErrorMessage(`Used by existing activities and not deleted: ${blockedNames.join(", ")}`);
+    }
+    return blockedNames.length === 0;
+  }
+
+  async function clearPackSize(packSize) {
+    setErrorMessage("");
+    setSuccessMessage("");
+    const { error } = await supabase.from("products").update({ pack_size: null }).eq("pack_size", Number(packSize));
 
     if (error) {
       console.error(error);
-      setErrorMessage(`${kind} could not be deleted.`);
+      setErrorMessage(`Pack size ${packSize} could not be deleted: ${error.message}`);
       return;
     }
 
     await loadMasterData();
+    setSuccessMessage(`Pack size ${packSize} deleted.`);
   }
 
   async function importMasterCsv(kind, fileList) {
@@ -1298,9 +1351,9 @@ export default function InventoryManagementSystem() {
             {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
             {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
-            {section === "Products" && isOwner && <MasterDataView kind="Products" records={products} hasSku onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
-            {section === "Customers" && isOwner && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
-            {section === "Suppliers" && isOwner && <MasterDataView kind="Suppliers" records={suppliers} onSave={saveMasterRecord} onDelete={deleteMasterRecord} onImport={importMasterCsv} />}
+            {section === "Products" && isOwner && <MasterDataView kind="Products" records={products} hasSku onDeletePackSize={clearPackSize} onSave={saveMasterRecord} onSaveMany={saveMasterRecords} onDeleteMany={deleteMasterRecords} onImport={importMasterCsv} />}
+            {section === "Customers" && isOwner && <MasterDataView kind="Customers" records={customers} onSave={saveMasterRecord} onSaveMany={saveMasterRecords} onDeleteMany={deleteMasterRecords} onImport={importMasterCsv} />}
+            {section === "Suppliers" && isOwner && <MasterDataView kind="Suppliers" records={suppliers} onSave={saveMasterRecord} onSaveMany={saveMasterRecords} onDeleteMany={deleteMasterRecords} onImport={importMasterCsv} />}
           </motion.div>
         </main>
       </div>
@@ -1686,11 +1739,52 @@ function PackSizeSelect({ value, options, onChange, className }) {
   );
 }
 
-function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImport }) {
+function MasterDataView({ kind, records, hasSku = false, onSave, onSaveMany, onDeleteMany, onDeletePackSize, onImport }) {
   const emptyRecord = hasSku ? { name: "", pack_size: "", sku: "", active: true } : { name: "", active: true };
   const [newRecord, setNewRecord] = useState(emptyRecord);
   const [editingRows, setEditingRows] = useState({});
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [busy, setBusy] = useState(false);
   const packSizeOptions = records.map((record) => record.pack_size);
+  const savedPackSizes = [...new Set(packSizeOptions.filter((size) => size !== "" && size != null).map(String))]
+    .sort((a, b) => Number(a) - Number(b));
+  const editedRecords = Object.values(editingRows);
+  const allSelected = records.length > 0 && records.every((record) => selectedIds.includes(record.id));
+
+  function toggleSelected(id) {
+    setSelectedIds((current) => (current.includes(id) ? current.filter((selectedId) => selectedId !== id) : [...current, id]));
+  }
+
+  function toggleAll() {
+    setSelectedIds(allSelected ? [] : records.map((record) => record.id));
+  }
+
+  async function saveEdited() {
+    if (editedRecords.length === 0) return;
+    setBusy(true);
+    if (await onSaveMany(kind, editedRecords)) setEditingRows({});
+    setBusy(false);
+  }
+
+  async function deleteSelected() {
+    const selectedRecords = records.filter((record) => selectedIds.includes(record.id));
+    if (selectedRecords.length === 0) return;
+    if (!window.confirm(`Delete ${selectedRecords.length} ${kind.toLowerCase()}?\n\n${selectedRecords.map((record) => record.name).join("\n")}`)) return;
+    setBusy(true);
+    await onDeleteMany(kind, selectedRecords);
+    setSelectedIds([]);
+    setEditingRows((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !selectedRecords.some((record) => String(record.id) === id))));
+    setBusy(false);
+  }
+
+  async function deletePackSize(packSize) {
+    const usedBy = records.filter((record) => String(record.pack_size) === packSize).length;
+    if (!window.confirm(`Delete pack size ${packSize}? It will be cleared from ${usedBy} product${usedBy === 1 ? "" : "s"}.`)) return;
+    setBusy(true);
+    await onDeletePackSize(packSize);
+    setEditingRows((current) => Object.fromEntries(Object.entries(current).map(([id, row]) => [id, String(row.pack_size) === packSize ? { ...row, pack_size: "" } : row])));
+    setBusy(false);
+  }
 
   function updateRow(record, patch) {
     setEditingRows((current) => ({
@@ -1719,7 +1813,28 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
           <input type="file" accept=".csv,text/csv" className="hidden" onChange={async (event) => { await onImport(kind, event.target.files); event.target.value = ""; }} />
         </label>
       </div>
+      {hasSku && onDeletePackSize && savedPackSizes.length > 0 && (
+        <div className="mt-4 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+          <span className="font-medium">Pack sizes:</span>
+          {savedPackSizes.map((size) => (
+            <span key={size} className="inline-flex items-center gap-1 rounded-full border border-slate-300 bg-white py-0.5 pl-2.5 pr-1 text-slate-700">
+              {size}
+              <button type="button" title={`Delete pack size ${size}`} className="rounded-full px-1 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" disabled={busy} onClick={() => deletePackSize(size)}>&times;</button>
+            </span>
+          ))}
+        </div>
+      )}
     </CardContent></Card>
+    <div className="mb-3 flex items-center justify-between gap-3">
+      <div className="text-sm text-slate-500">
+        {selectedIds.length > 0 ? `${selectedIds.length} selected` : "Check rows to delete them."}
+        {editedRecords.length > 0 && ` · ${editedRecords.length} unsaved change${editedRecords.length === 1 ? "" : "s"}`}
+      </div>
+      <div className="flex gap-2">
+        <Button onClick={saveEdited} disabled={busy || editedRecords.length === 0}><Save size={16} className="mr-2" />Save{editedRecords.length > 0 ? ` (${editedRecords.length})` : ""}</Button>
+        <Button variant="outline" onClick={deleteSelected} disabled={busy || selectedIds.length === 0} className="text-red-600"><Trash2 size={16} className="mr-2" />Delete{selectedIds.length > 0 ? ` (${selectedIds.length})` : ""}</Button>
+      </div>
+    </div>
     <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
       <table className="w-full text-sm">
         <thead className="bg-slate-100 text-slate-600">
@@ -1728,7 +1843,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
             {hasSku && <th className="text-left px-4 py-3 font-semibold">Pack-Size</th>}
             {hasSku && <th className="text-left px-4 py-3 font-semibold">SKU</th>}
             <th className="text-left px-4 py-3 font-semibold">Active</th>
-            <th className="text-left px-4 py-3 font-semibold">Actions</th>
+            <th className="w-12 px-4 py-3 text-left"><input type="checkbox" aria-label={`Select all ${kind.toLowerCase()}`} checked={allSelected} onChange={toggleAll} /></th>
           </tr>
         </thead>
         <tbody>
@@ -1740,12 +1855,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
                 {hasSku && <td className="px-4 py-3"><PackSizeSelect className="w-full rounded border px-2 py-1" value={draft.pack_size} options={packSizeOptions} onChange={(value) => updateRow(record, { pack_size: value })} /></td>}
                 {hasSku && <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.sku || ""} onChange={(event) => updateRow(record, { sku: event.target.value })} /></td>}
                 <td className="px-4 py-3"><select className="rounded border px-2 py-1" value={draft.active === false ? "false" : "true"} onChange={(event) => updateRow(record, { active: event.target.value === "true" })}><option value="true">Active</option><option value="false">Inactive</option></select></td>
-                <td className="px-4 py-3">
-                  <div className="flex gap-2">
-                    <Button size="sm" onClick={() => onSave(kind, draft)}>Save</Button>
-                    <Button size="sm" variant="ghost" onClick={() => onDelete(kind, record)}><Trash2 size={16} /></Button>
-                  </div>
-                </td>
+                <td className="px-4 py-3"><input type="checkbox" aria-label={`Select ${record.name}`} checked={selectedIds.includes(record.id)} onChange={() => toggleSelected(record.id)} /></td>
               </tr>
             );
           })}
