@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import {
   Search,
@@ -1687,35 +1687,74 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
   </>;
 }
 
-const ADD_NEW_PACK_SIZE = "__add_new__";
-
-function PackSizeSelect({ value, options, onChange, className }) {
+function PackSizeSelect({ value, options, onChange, onDeleteOption, disabled = false, className }) {
   const [adding, setAdding] = useState(false);
+  const [menuPosition, setMenuPosition] = useState(null);
+  const triggerRef = useRef(null);
+  const menuRef = useRef(null);
   const currentValue = value ?? "";
-  const choices = [...new Set([...options, currentValue].filter((option) => option !== "" && option != null).map(String))]
+  const savedOptions = new Set(options.filter((option) => option !== "" && option != null).map(String));
+  const choices = [...new Set([...savedOptions, ...(currentValue === "" ? [] : [String(currentValue)])])]
     .sort((a, b) => Number(a) - Number(b));
 
+  useEffect(() => {
+    if (!menuPosition) return undefined;
+    function closeOnOutsideClick(event) {
+      if (!menuRef.current?.contains(event.target) && !triggerRef.current?.contains(event.target)) setMenuPosition(null);
+    }
+    function close() {
+      setMenuPosition(null);
+    }
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [menuPosition]);
+
+  function toggleMenu() {
+    if (menuPosition) {
+      setMenuPosition(null);
+      return;
+    }
+    // Fixed positioning keeps the menu from being clipped by the table's rounded container.
+    const rect = triggerRef.current.getBoundingClientRect();
+    setMenuPosition({ top: rect.bottom + 4, left: rect.left, width: Math.max(rect.width, 160) });
+  }
+
+  function choose(nextValue) {
+    setMenuPosition(null);
+    onChange(nextValue);
+  }
+
   if (adding) {
-    return <input type="number" autoFocus className={className} placeholder="New pack size" value={currentValue} onChange={(event) => onChange(event.target.value)} onBlur={() => setAdding(false)} />;
+    return <input type="number" autoFocus className={className} placeholder="New pack size" value={currentValue} onChange={(event) => onChange(event.target.value)} onBlur={() => setAdding(false)} onKeyDown={(event) => { if (event.key === "Enter") setAdding(false); }} />;
   }
 
   return (
-    <select
-      className={className}
-      value={String(currentValue)}
-      onChange={(event) => {
-        if (event.target.value === ADD_NEW_PACK_SIZE) {
-          onChange("");
-          setAdding(true);
-        } else {
-          onChange(event.target.value);
-        }
-      }}
-    >
-      <option value="">-</option>
-      {choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
-      <option value={ADD_NEW_PACK_SIZE}>Add new...</option>
-    </select>
+    <>
+      <button type="button" ref={triggerRef} disabled={disabled} className={`${className} flex items-center justify-between gap-2 text-left disabled:opacity-60`} onClick={toggleMenu}>
+        <span className={currentValue === "" ? "text-slate-400" : ""}>{currentValue === "" ? "-" : currentValue}</span>
+        <span className="text-[10px] text-slate-400">&#9662;</span>
+      </button>
+      {menuPosition && (
+        <div ref={menuRef} className="fixed z-50 max-h-64 overflow-y-auto rounded-xl border bg-white py-1 text-sm text-slate-700 shadow-lg" style={menuPosition}>
+          <button type="button" className="block w-full px-3 py-1.5 text-left text-slate-400 hover:bg-slate-100" onClick={() => choose("")}>-</button>
+          {choices.map((choice) => (
+            <div key={choice} className={`flex items-center justify-between hover:bg-slate-100 ${choice === String(currentValue) ? "bg-slate-50 font-medium" : ""}`}>
+              <button type="button" className="flex-1 px-3 py-1.5 text-left" onClick={() => choose(choice)}>{choice}</button>
+              {onDeleteOption && savedOptions.has(choice) && (
+                <button type="button" title={`Delete pack size ${choice}`} className="mr-1 rounded px-2 py-1 text-slate-400 hover:bg-red-50 hover:text-red-600" onClick={() => { setMenuPosition(null); onDeleteOption(choice); }}>&times;</button>
+              )}
+            </div>
+          ))}
+          <button type="button" className="block w-full border-t px-3 py-1.5 text-left font-medium hover:bg-slate-100" onClick={() => { setMenuPosition(null); onChange(""); setAdding(true); }}>Add new...</button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1726,8 +1765,6 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onSaveMany, onD
   const [selectedIds, setSelectedIds] = useState([]);
   const [busy, setBusy] = useState(false);
   const packSizeOptions = records.map((record) => record.pack_size);
-  const savedPackSizes = [...new Set(packSizeOptions.filter((size) => size !== "" && size != null).map(String))]
-    .sort((a, b) => Number(a) - Number(b));
   const editedRecords = Object.values(editingRows);
   const allSelected = records.length > 0 && records.every((record) => selectedIds.includes(record.id));
 
@@ -1784,7 +1821,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onSaveMany, onD
     <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
       <div className={`grid gap-3 ${hasSku ? "grid-cols-6" : "grid-cols-4"}`}>
         <Input label="Name" value={newRecord.name} onChange={(value) => setNewRecord({ ...newRecord, name: value })} />
-        {hasSku && <label className="text-xs font-medium text-slate-500"><span>Pack-Size</span><PackSizeSelect className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={newRecord.pack_size} options={packSizeOptions} onChange={(value) => setNewRecord({ ...newRecord, pack_size: value })} /></label>}
+        {hasSku && <div className="text-xs font-medium text-slate-500"><span>Pack-Size</span><PackSizeSelect className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm font-normal text-slate-900" value={newRecord.pack_size} options={packSizeOptions} disabled={busy} onDeleteOption={onDeletePackSize ? deletePackSize : undefined} onChange={(value) => setNewRecord({ ...newRecord, pack_size: value })} /></div>}
         {hasSku && <Input label="SKU" value={newRecord.sku} onChange={(value) => setNewRecord({ ...newRecord, sku: value })} />}
         <Select label="Active" value={newRecord.active ? "true" : "false"} onChange={(value) => setNewRecord({ ...newRecord, active: value === "true" })} options={["true", "false"]} />
         <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add</Button></div>
@@ -1793,17 +1830,6 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onSaveMany, onD
           <input type="file" accept=".csv,text/csv" className="hidden" onChange={async (event) => { await onImport(kind, event.target.files); event.target.value = ""; }} />
         </label>
       </div>
-      {hasSku && onDeletePackSize && savedPackSizes.length > 0 && (
-        <div className="mt-4 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-          <span className="font-medium">Pack sizes:</span>
-          {savedPackSizes.map((size) => (
-            <span key={size} className="inline-flex items-center gap-1 rounded-full border border-slate-300 bg-white py-0.5 pl-2.5 pr-1 text-slate-700">
-              {size}
-              <button type="button" title={`Delete pack size ${size}`} className="rounded-full px-1 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40" disabled={busy} onClick={() => deletePackSize(size)}>&times;</button>
-            </span>
-          ))}
-        </div>
-      )}
     </CardContent></Card>
     <div className="mb-3 flex items-center justify-between gap-3">
       <div className="text-sm text-slate-500">
@@ -1832,7 +1858,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onSaveMany, onD
             return (
               <tr key={record.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.name || ""} onChange={(event) => updateRow(record, { name: event.target.value })} /></td>
-                {hasSku && <td className="px-4 py-3"><PackSizeSelect className="w-full rounded border px-2 py-1" value={draft.pack_size} options={packSizeOptions} onChange={(value) => updateRow(record, { pack_size: value })} /></td>}
+                {hasSku && <td className="px-4 py-3"><PackSizeSelect className="w-full rounded border bg-white px-2 py-1" value={draft.pack_size} options={packSizeOptions} disabled={busy} onDeleteOption={onDeletePackSize ? deletePackSize : undefined} onChange={(value) => updateRow(record, { pack_size: value })} /></td>}
                 {hasSku && <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.sku || ""} onChange={(event) => updateRow(record, { sku: event.target.value })} /></td>}
                 <td className="px-4 py-3"><select className="rounded border px-2 py-1" value={draft.active === false ? "false" : "true"} onChange={(event) => updateRow(record, { active: event.target.value === "true" })}><option value="true">Active</option><option value="false">Inactive</option></select></td>
                 <td className="px-4 py-3"><input type="checkbox" aria-label={`Select ${record.name}`} checked={selectedIds.includes(record.id)} onChange={() => toggleSelected(record.id)} /></td>
