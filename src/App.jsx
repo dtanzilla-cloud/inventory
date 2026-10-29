@@ -528,7 +528,7 @@ export default function InventoryManagementSystem() {
 
   async function loadMasterData() {
     const [productsResult, customersResult, suppliersResult] = await Promise.all([
-      supabase.from("products").select("id, name, sku, active, created_at").order("name", { ascending: true }),
+      supabase.from("products").select("id, name, pack_size, sku, active, created_at").order("name", { ascending: true }),
       supabase.from("customers").select("id, name, active, created_at").order("name", { ascending: true }),
       supabase.from("suppliers").select("id, name, active, created_at").order("name", { ascending: true }),
     ]);
@@ -1044,7 +1044,7 @@ export default function InventoryManagementSystem() {
     setErrorMessage("");
     setSuccessMessage("");
     const payload = config.hasSku
-      ? { name: record.name, sku: record.sku || null, active: record.active !== false }
+      ? { name: record.name, pack_size: record.pack_size === "" || record.pack_size == null ? null : Number(record.pack_size), sku: record.sku || null, active: record.active !== false }
       : { name: record.name, active: record.active !== false };
 
     const query = record.id
@@ -1635,7 +1635,7 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
 }
 
 function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImport }) {
-  const emptyRecord = hasSku ? { name: "", sku: "", active: true } : { name: "", active: true };
+  const emptyRecord = hasSku ? { name: "", pack_size: "", sku: "", active: true } : { name: "", active: true };
   const [newRecord, setNewRecord] = useState(emptyRecord);
   const [editingRows, setEditingRows] = useState({});
 
@@ -1655,8 +1655,9 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
   return <>
     <Header title={`Settings - ${kind}`} subtitle="Owner-managed master data for activity entry." />
     <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
-      <div className={`grid gap-3 ${hasSku ? "grid-cols-5" : "grid-cols-4"}`}>
+      <div className={`grid gap-3 ${hasSku ? "grid-cols-6" : "grid-cols-4"}`}>
         <Input label="Name" value={newRecord.name} onChange={(value) => setNewRecord({ ...newRecord, name: value })} />
+        {hasSku && <Input label="Pack-Size" type="number" value={newRecord.pack_size} onChange={(value) => setNewRecord({ ...newRecord, pack_size: value })} />}
         {hasSku && <Input label="SKU" value={newRecord.sku} onChange={(value) => setNewRecord({ ...newRecord, sku: value })} />}
         <Select label="Active" value={newRecord.active ? "true" : "false"} onChange={(value) => setNewRecord({ ...newRecord, active: value === "true" })} options={["true", "false"]} />
         <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add</Button></div>
@@ -1671,6 +1672,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
         <thead className="bg-slate-100 text-slate-600">
           <tr>
             <th className="text-left px-4 py-3 font-semibold">Name</th>
+            {hasSku && <th className="text-left px-4 py-3 font-semibold">Pack-Size</th>}
             {hasSku && <th className="text-left px-4 py-3 font-semibold">SKU</th>}
             <th className="text-left px-4 py-3 font-semibold">Active</th>
             <th className="text-left px-4 py-3 font-semibold">Actions</th>
@@ -1682,6 +1684,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
             return (
               <tr key={record.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.name || ""} onChange={(event) => updateRow(record, { name: event.target.value })} /></td>
+                {hasSku && <td className="px-4 py-3"><input type="number" className="w-full rounded border px-2 py-1" value={draft.pack_size ?? ""} onChange={(event) => updateRow(record, { pack_size: event.target.value })} /></td>}
                 {hasSku && <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.sku || ""} onChange={(event) => updateRow(record, { sku: event.target.value })} /></td>}
                 <td className="px-4 py-3"><select className="rounded border px-2 py-1" value={draft.active === false ? "false" : "true"} onChange={(event) => updateRow(record, { active: event.target.value === "true" })}><option value="true">Active</option><option value="false">Inactive</option></select></td>
                 <td className="px-4 py-3">
