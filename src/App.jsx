@@ -14,6 +14,7 @@ import {
   DollarSign,
   Save,
 } from "lucide-react";
+import readXlsxFile from "read-excel-file/browser";
 import { supabase } from "./supabaseClient";
 
 const ALL_WAREHOUSES = "All";
@@ -21,6 +22,8 @@ const DEFAULT_WAREHOUSE = { id: null, code: "WH-A", name: "Warehouse A", active:
 const DOCUMENT_BUCKET = "activity-documents";
 const CHARGE_INVOICE_BUCKET = "charge-invoices";
 const DEFAULT_CHARGE_MONTH = "December 2025";
+const QB_STORAGE_KEY = "inventory.qbSnapshot";
+const QB_NON_PRODUCT_PATTERN = /adjustment|^test$/i;
 
 function money(n) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
@@ -382,6 +385,82 @@ function parseRepack(value) {
   return null;
 }
 
+// QuickBooks sub-items look like "Parent:Child - CF"; the parent is the product and the
+// trailing uppercase code (CF, CT, IN...) is the warehouse it sits in.
+function qbParentName(item) {
+  return String(item ?? "").split(":")[0].trim();
+}
+
+function qbWarehouseCode(item) {
+  const [, child = ""] = String(item ?? "").split(":");
+  const match = child.trim().match(/(?:\s-\s*|\s)([A-Z]{2,4})$/);
+  return match ? match[1] : null;
+}
+
+function qbItemInWarehouse(qbItem, warehouseRecord) {
+  if (!warehouseRecord) return true;
+  const code = normalizeLookup(qbItem.warehouse_code);
+  return Boolean(code) && [warehouseRecord.code, warehouseRecord.name].some((value) => normalizeLookup(value) === code);
+}
+
+function parseQbQuantity(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const number = Number(String(value).replace(/,/g, ""));
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseQbRows(rows) {
+  const headerIndex = rows.findIndex((row) => row.some((cell) => normalizeLookup(String(cell ?? "")) === "item"));
+  if (headerIndex < 0) return null;
+
+  const header = rows[headerIndex].map((cell) => normalizeLookup(String(cell ?? "")));
+  const itemColumn = header.indexOf("item");
+  const qtyColumn = header.findIndex((cell) => ["quantity on hand", "qty on hand", "on hand"].includes(cell));
+  if (qtyColumn < 0) return null;
+
+  const totals = new Map();
+  rows.slice(headerIndex + 1).forEach((row) => {
+    const name = qbParentName(row[itemColumn]);
+    const warehouseCode = qbWarehouseCode(row[itemColumn]);
+    const qty = parseQbQuantity(row[qtyColumn]);
+    if (!name || qty === null || normalizeLookup(name).startsWith("total")) return;
+
+    const key = inventoryKey(normalizeLookup(name), warehouseCode);
+    const current = totals.get(key) || { name, warehouse_code: warehouseCode, qty_lb: 0 };
+    current.qty_lb += qty;
+    totals.set(key, current);
+  });
+
+  return Array.from(totals.values());
+}
+
+async function readQbFile(file) {
+  if (/\.csv$/i.test(file.name)) {
+    const items = parseQbRows((await file.text()).split(/\r?\n/).map(parseCsvLine));
+    if (items) return items;
+  } else {
+    const sheets = await readXlsxFile(file);
+    for (const { data } of sheets) {
+      const items = parseQbRows(data);
+      if (items) return items;
+    }
+  }
+  throw new Error('No sheet with "Item" and "Quantity On Hand" columns was found.');
+}
+
+function loadQbSnapshot() {
+  try {
+    return JSON.parse(localStorage.getItem(QB_STORAGE_KEY)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function formatQty(value) {
+  if (value === null || value === undefined) return "—";
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
 function optionNames(records, rawValue) {
   const names = records.filter((record) => record.active !== false).map((record) => record.name);
   return rawValue && !names.includes(rawValue) ? [rawValue, ...names] : names;
@@ -415,6 +494,10 @@ export default function InventoryManagementSystem() {
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
   const [editingCell, setEditingCell] = useState(null);
   const [inventorySort, setInventorySort] = useState({ key: "item", direction: "asc" });
+  const [inventoryUnit, setInventoryUnit] = useState("pc");
+  const [qbSnapshot, setQbSnapshot] = useState(loadQbSnapshot);
+  const [uploadingQb, setUploadingQb] = useState(false);
+  const [newQbProducts, setNewQbProducts] = useState([]);
   const [successMessage, setSuccessMessage] = useState("");
   const isOwner = profile?.role === "owner" || profile?.role === "admin";
   const activeWarehouses = warehouses.filter((warehouseRecord) => warehouseRecord.active);
@@ -687,10 +770,44 @@ export default function InventoryManagementSystem() {
     });
   }, [activitySort, visibleActivities]);
 
-  const visibleInventory = useMemo(
-    () => deriveInventoryRowsFromActivities({ activities, warehouseFilter: warehouse, warehouseRecords: warehouses }),
-    [activities, warehouse, warehouses],
-  );
+  const showQb = Boolean(qbSnapshot);
+  const visibleInventory = useMemo(() => {
+    const rows = deriveInventoryRowsFromActivities({ activities, warehouseFilter: warehouse, warehouseRecords: warehouses });
+    const packSizes = new Map(products.map((product) => [normalizeLookup(product.name), Number(product.pack_size) || null]));
+    const selectedWarehouse = warehouse === ALL_WAREHOUSES ? null : warehouseRecordForFilter(warehouse, warehouses);
+    const qbQuantities = new Map();
+    (showQb ? qbSnapshot.items : [])
+      .filter((qbItem) => qbItemInWarehouse(qbItem, selectedWarehouse))
+      .forEach((qbItem) => {
+        const key = normalizeLookup(qbItem.name);
+        const current = qbQuantities.get(key) || { name: qbItem.name, qty_lb: 0 };
+        current.qty_lb += qbItem.qty_lb;
+        qbQuantities.set(key, current);
+      });
+
+    const inventoryItems = new Set(rows.map((row) => normalizeLookup(row.item)));
+    qbQuantities.forEach((qbItem, key) => {
+      if (qbItem.qty_lb === 0 || inventoryItems.has(key) || QB_NON_PRODUCT_PATTERN.test(qbItem.name)) return;
+      rows.push({ item: qbItem.name, warehouse: selectedWarehouse?.name || ALL_WAREHOUSES, pallets: 0, in_qty: 0, reserved_qty: 0, incoming_qty: 0 });
+    });
+
+    return rows.map((row) => {
+      const key = normalizeLookup(row.item);
+      const packSize = packSizes.get(key) || null;
+      const qbLb = qbQuantities.has(key) ? qbQuantities.get(key).qty_lb : null;
+      const toUnit = (pieces) => inventoryUnit === "lb" ? (packSize ? pieces * packSize : null) : pieces;
+
+      return {
+        ...row,
+        pack_size: packSize,
+        in_qty: toUnit(row.in_qty),
+        reserved_qty: toUnit(row.reserved_qty),
+        incoming_qty: toUnit(row.incoming_qty),
+        qb_qty: qbLb === null ? null : inventoryUnit === "lb" ? qbLb : packSize ? qbLb / packSize : null,
+        qb_mismatch: qbLb !== null && packSize ? Math.abs(row.in_qty * packSize - qbLb) >= 0.5 : null,
+      };
+    });
+  }, [activities, warehouse, warehouses, products, showQb, qbSnapshot, inventoryUnit]);
   const sortedInventory = useMemo(() => {
     const direction = inventorySort.direction === "asc" ? 1 : -1;
     return [...visibleInventory].sort((a, b) => {
@@ -809,6 +926,79 @@ export default function InventoryManagementSystem() {
     setActivities((current) => current.filter((activity) => activity.id !== id));
   }
 
+  async function uploadQbInventory(fileList) {
+    const [file] = Array.from(fileList || []);
+    if (!file) return;
+
+    setErrorMessage("");
+    setSuccessMessage("");
+    setUploadingQb(true);
+
+    try {
+      const items = await readQbFile(file);
+      const snapshot = { file_name: file.name, uploaded_at: new Date().toISOString(), items };
+      setQbSnapshot(snapshot);
+      try {
+        localStorage.setItem(QB_STORAGE_KEY, JSON.stringify(snapshot));
+      } catch (storageError) {
+        console.error(storageError);
+      }
+
+      const productNames = new Set(products.map((product) => normalizeLookup(product.name)));
+      const qbProductNames = Array.from(new Set(items.map((qbItem) => qbItem.name)));
+      setNewQbProducts(qbProductNames.filter((name) => !productNames.has(normalizeLookup(name))));
+
+      const unmatchedCodes = Array.from(new Set(
+        items
+          .filter((qbItem) => qbItem.warehouse_code && !warehouses.some((warehouseRecord) => qbItemInWarehouse(qbItem, warehouseRecord)))
+          .map((qbItem) => qbItem.warehouse_code),
+      ));
+      setSuccessMessage(`QuickBooks data loaded: ${qbProductNames.length} products from ${file.name}.${unmatchedCodes.length > 0 ? ` Warehouse codes with no matching warehouse (shown only on All warehouses): ${unmatchedCodes.join(", ")}.` : ""}`);
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(`QuickBooks upload failed: ${error.message}`);
+    } finally {
+      setUploadingQb(false);
+    }
+  }
+
+  function clearQbSnapshot() {
+    setQbSnapshot(null);
+    setNewQbProducts([]);
+    try {
+      localStorage.removeItem(QB_STORAGE_KEY);
+    } catch (storageError) {
+      console.error(storageError);
+    }
+  }
+
+  async function addQbProducts(names) {
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    if (names.length > 0) {
+      // products.name has no unique constraint in the database, so skip existing names instead of upserting.
+      const { data: existing, error: existingError } = await supabase.from("products").select("name");
+      const existingNames = new Set((existing || []).map((product) => normalizeLookup(product.name)));
+      const rows = names
+        .filter((name) => !existingNames.has(normalizeLookup(name)))
+        .map((name) => ({ name, sku: null, pack_size: null, active: true }));
+      const { error } = existingError || rows.length === 0
+        ? { error: existingError }
+        : await supabase.from("products").insert(rows);
+
+      if (error) {
+        console.error(error);
+        setErrorMessage(`Products could not be added: ${error.message}`);
+        return;
+      }
+
+      await loadMasterData();
+      setSuccessMessage(`${rows.length} product${rows.length === 1 ? "" : "s"} added from QuickBooks.`);
+    }
+    setNewQbProducts([]);
+  }
+
   async function ensureMasterDataForImport(kind, names, existingRecords) {
     const config = masterDataConfig[kind];
     const existingNames = new Set(existingRecords.map((record) => normalizeLookup(record.name)));
@@ -821,9 +1011,7 @@ export default function InventoryManagementSystem() {
       throw new Error(`Missing ${kind.toLowerCase()} master data: ${rows.map((row) => row.name).join(", ")}`);
     }
 
-    const { error } = await supabase
-      .from(config.table)
-      .upsert(rows, { onConflict: "name", ignoreDuplicates: true });
+    const { error } = await supabase.from(config.table).insert(rows);
 
     if (error) throw error;
   }
@@ -1347,7 +1535,7 @@ export default function InventoryManagementSystem() {
             {errorMessage && <div className="mb-4 whitespace-pre-line rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
             {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
-            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} />}
+            {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} unit={inventoryUnit} setUnit={setInventoryUnit} canUploadQb={isOwner && warehouse === ALL_WAREHOUSES} showQb={showQb} qbSnapshot={qbSnapshot} uploadingQb={uploadingQb} onUploadQb={uploadQbInventory} onClearQb={clearQbSnapshot} newQbProducts={newQbProducts} onAddQbProducts={addQbProducts} />}
             {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
             {section === "Warehouses" && isOwner && <WarehouseSettings warehouses={warehouses} saveWarehouse={saveWarehouse} />}
@@ -1586,13 +1774,14 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
   );
 }
 
-function InventoryView({ warehouse, rows, sort, setSort }) {
+function InventoryView({ warehouse, rows, sort, setSort, unit, setUnit, canUploadQb, showQb, qbSnapshot, uploadingQb, onUploadQb, onClearQb, newQbProducts, onAddQbProducts }) {
   const columns = [
     ["item", "Item"],
     ["pallets", "Pallets"],
-    ["in_qty", "Pcs"],
+    ["in_qty", unit === "lb" ? "On Hand (lb)" : "Pcs"],
     ["reserved_qty", "Reserved"],
     ["incoming_qty", "Incoming"],
+    ...(showQb ? [["qb_qty", `QuickBooks (${unit})`]] : []),
   ];
 
   function toggleSort(key) {
@@ -1604,6 +1793,28 @@ function InventoryView({ warehouse, rows, sort, setSort }) {
 
   return <>
     <Header title={`Inventory - ${warehouse}`} />
+    <div className="mb-4 flex flex-wrap items-center gap-3">
+      <div className="inline-flex rounded-xl border border-slate-300 bg-white p-1 text-sm font-medium">
+        {["pc", "lb"].map((option) => (
+          <button key={option} className={`rounded-lg px-3 py-1 transition ${unit === option ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"}`} onClick={() => setUnit(option)}>{option}</button>
+        ))}
+      </div>
+      {canUploadQb && (
+        <label className={`inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium transition hover:bg-slate-100 ${uploadingQb ? "cursor-wait opacity-60" : "cursor-pointer"}`}>
+          <Upload size={16} className="mr-2" />{uploadingQb ? "Reading" : "Upload QuickBooks Data"}
+          <input type="file" accept=".xlsx,.csv" className="hidden" disabled={uploadingQb} onChange={(event) => { onUploadQb(event.target.files); event.target.value = ""; }} />
+        </label>
+      )}
+      {showQb && (
+        <span className="text-sm text-slate-500">
+          QuickBooks: {qbSnapshot.file_name}, {new Date(qbSnapshot.uploaded_at).toLocaleString()}
+          {canUploadQb
+            ? <button className="ml-2 text-slate-700 underline hover:text-slate-900" onClick={onClearQb}>Clear</button>
+            : " (only QB sub-items tagged with this warehouse's code)"}
+        </span>
+      )}
+    </div>
+    {canUploadQb && newQbProducts.length > 0 && <NewQbProductsPanel key={newQbProducts.join("|")} names={newQbProducts} onAdd={onAddQbProducts} />}
     <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
       <table className="w-full text-sm">
         <thead className="bg-slate-100 text-slate-600">
@@ -1622,15 +1833,67 @@ function InventoryView({ warehouse, rows, sort, setSort }) {
             <tr key={`${row.item}-${row.warehouse_id || row.warehouse || index}`} className="border-t hover:bg-slate-50">
               <td className="px-4 py-3 align-top">{row.item}</td>
               <td className="px-4 py-3 align-top">{Number(row.pallets) || 0}</td>
-              <td className="px-4 py-3 align-top">{Number(row.in_qty) || 0}</td>
-              <td className="px-4 py-3 align-top">{Number(row.reserved_qty) || 0}</td>
-              <td className="px-4 py-3 align-top">{Number(row.incoming_qty) || 0}</td>
+              <QtyCell value={row.in_qty} packSize={row.pack_size} />
+              <QtyCell value={row.reserved_qty} packSize={row.pack_size} />
+              <QtyCell value={row.incoming_qty} packSize={row.pack_size} />
+              {showQb && (
+                <td
+                  className={`px-4 py-3 align-top ${row.qb_mismatch ? "bg-amber-50 font-semibold text-amber-800" : row.qb_mismatch === false ? "text-emerald-700" : ""}`}
+                  title={row.qb_qty === null ? "Not in QuickBooks, or no pack size to convert lb to pc" : row.qb_mismatch ? "Differs from on-hand quantity" : undefined}
+                >
+                  {formatQty(row.qb_qty)}
+                </td>
+              )}
             </tr>
           ))}
         </tbody>
       </table>
     </div>
   </>;
+}
+
+function QtyCell({ value, packSize }) {
+  return <td className="px-4 py-3 align-top" title={value === null && !packSize ? "Set a pack size on the Products page to show lb" : undefined}>{formatQty(value)}</td>;
+}
+
+function NewQbProductsPanel({ names, onAdd }) {
+  const [selected, setSelected] = useState(() => new Set(names.filter((name) => !QB_NON_PRODUCT_PATTERN.test(name))));
+  const [busy, setBusy] = useState(false);
+
+  function toggle(name) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  async function add(namesToAdd) {
+    setBusy(true);
+    await onAdd(namesToAdd);
+    setBusy(false);
+  }
+
+  return (
+    <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <p className="font-medium text-amber-900">{names.length} QuickBooks item{names.length === 1 ? " is" : "s are"} not on the Products page. Add the checked ones?</p>
+        <div className="flex gap-2">
+          <Button className="rounded-xl" disabled={busy || selected.size === 0} onClick={() => add(names.filter((name) => selected.has(name)))}><Plus size={16} className="mr-2" />Add {selected.size} product{selected.size === 1 ? "" : "s"}</Button>
+          <Button variant="outline" disabled={busy} onClick={() => add([])}>Dismiss</Button>
+        </div>
+      </div>
+      <div className="grid max-h-64 grid-cols-1 gap-1 overflow-y-auto sm:grid-cols-2 lg:grid-cols-3">
+        {names.map((name) => (
+          <label key={name} className="flex items-center gap-2 text-slate-700">
+            <input type="checkbox" checked={selected.has(name)} disabled={busy} onChange={() => toggle(name)} />
+            {name}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoice, onSaveRates, onUploadInvoices, warehouses, isOwner, chargesWarehouse, setChargesWarehouse }) {
