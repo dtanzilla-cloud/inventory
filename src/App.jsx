@@ -1634,10 +1634,43 @@ function ChargesView({ month, months, setMonth, charges, loading, uploadingInvoi
   </>;
 }
 
+const ADD_NEW_PACK_SIZE = "__add_new__";
+
+function PackSizeSelect({ value, options, onChange, className }) {
+  const [adding, setAdding] = useState(false);
+  const currentValue = value ?? "";
+  const choices = [...new Set([...options, currentValue].filter((option) => option !== "" && option != null).map(String))]
+    .sort((a, b) => Number(a) - Number(b));
+
+  if (adding) {
+    return <input type="number" autoFocus className={className} placeholder="New pack size" value={currentValue} onChange={(event) => onChange(event.target.value)} onBlur={() => setAdding(false)} />;
+  }
+
+  return (
+    <select
+      className={className}
+      value={String(currentValue)}
+      onChange={(event) => {
+        if (event.target.value === ADD_NEW_PACK_SIZE) {
+          onChange("");
+          setAdding(true);
+        } else {
+          onChange(event.target.value);
+        }
+      }}
+    >
+      <option value="">-</option>
+      {choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+      <option value={ADD_NEW_PACK_SIZE}>Add new...</option>
+    </select>
+  );
+}
+
 function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImport }) {
   const emptyRecord = hasSku ? { name: "", pack_size: "", sku: "", active: true } : { name: "", active: true };
   const [newRecord, setNewRecord] = useState(emptyRecord);
   const [editingRows, setEditingRows] = useState({});
+  const packSizeOptions = records.map((record) => record.pack_size);
 
   function updateRow(record, patch) {
     setEditingRows((current) => ({
@@ -1657,7 +1690,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
     <Card className="rounded-2xl shadow-sm mb-6"><CardContent className="p-5">
       <div className={`grid gap-3 ${hasSku ? "grid-cols-6" : "grid-cols-4"}`}>
         <Input label="Name" value={newRecord.name} onChange={(value) => setNewRecord({ ...newRecord, name: value })} />
-        {hasSku && <Input label="Pack-Size" type="number" value={newRecord.pack_size} onChange={(value) => setNewRecord({ ...newRecord, pack_size: value })} />}
+        {hasSku && <label className="text-xs font-medium text-slate-500"><span>Pack-Size</span><PackSizeSelect className="mt-1 w-full px-3 py-2 border rounded-xl bg-white text-sm" value={newRecord.pack_size} options={packSizeOptions} onChange={(value) => setNewRecord({ ...newRecord, pack_size: value })} /></label>}
         {hasSku && <Input label="SKU" value={newRecord.sku} onChange={(value) => setNewRecord({ ...newRecord, sku: value })} />}
         <Select label="Active" value={newRecord.active ? "true" : "false"} onChange={(value) => setNewRecord({ ...newRecord, active: value === "true" })} options={["true", "false"]} />
         <div className="flex items-end"><Button onClick={saveNew} className="w-full"><Plus size={16} className="mr-2" />Add</Button></div>
@@ -1684,7 +1717,7 @@ function MasterDataView({ kind, records, hasSku = false, onSave, onDelete, onImp
             return (
               <tr key={record.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.name || ""} onChange={(event) => updateRow(record, { name: event.target.value })} /></td>
-                {hasSku && <td className="px-4 py-3"><input type="number" className="w-full rounded border px-2 py-1" value={draft.pack_size ?? ""} onChange={(event) => updateRow(record, { pack_size: event.target.value })} /></td>}
+                {hasSku && <td className="px-4 py-3"><PackSizeSelect className="w-full rounded border px-2 py-1" value={draft.pack_size} options={packSizeOptions} onChange={(value) => updateRow(record, { pack_size: value })} /></td>}
                 {hasSku && <td className="px-4 py-3"><input className="w-full rounded border px-2 py-1" value={draft.sku || ""} onChange={(event) => updateRow(record, { sku: event.target.value })} /></td>}
                 <td className="px-4 py-3"><select className="rounded border px-2 py-1" value={draft.active === false ? "false" : "true"} onChange={(event) => updateRow(record, { active: event.target.value === "true" })}><option value="true">Active</option><option value="false">Inactive</option></select></td>
                 <td className="px-4 py-3">
