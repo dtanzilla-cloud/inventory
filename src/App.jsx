@@ -51,7 +51,7 @@ function formatDateDisplay(dateValue) {
   const key = normalizeDateKey(dateValue);
   if (!key) return "";
   const [year, month, day] = key.split("-");
-  return `${month}/${day}/${year}`;
+  return `${month}-${day}-${year}`;
 }
 
 function dateKey(date) {
