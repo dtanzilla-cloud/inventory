@@ -22,6 +22,17 @@ const DEFAULT_WAREHOUSE = { id: null, code: "WH-A", name: "Warehouse A", active:
 const DOCUMENT_BUCKET = "activity-documents";
 const CHARGE_INVOICE_BUCKET = "charge-invoices";
 const DEFAULT_CHARGE_MONTH = "December 2025";
+const OWNER_SECTIONS = ["Settings", "Warehouses", "Products", "Customers", "Suppliers"];
+const SECTION_SLUGS = {
+  Activities: "activities",
+  Inventory: "inventory",
+  Charges: "charges",
+  Settings: "users",
+  Warehouses: "warehouses",
+  Products: "products",
+  Customers: "customers",
+  Suppliers: "suppliers",
+};
 const QB_STORAGE_KEY = "inventory.qbSnapshot";
 const QB_NON_PRODUCT_PATTERN = /adjustment|^test$/i;
 
@@ -365,6 +376,26 @@ function parseRepack(value) {
   return null;
 }
 
+// Pages live in the URL hash, e.g. #/inventory or #/inventory/CT (warehouse code).
+function routeFromHash(hash) {
+  let parts;
+  try {
+    parts = hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
+  } catch {
+    parts = [];
+  }
+  const [slug = "", warehouseSlug = ""] = parts;
+  const section = Object.keys(SECTION_SLUGS).find((key) => SECTION_SLUGS[key] === slug) || "Activities";
+  return { section, warehouse: section === "Inventory" && warehouseSlug ? warehouseSlug : ALL_WAREHOUSES };
+}
+
+function hashForRoute(section, warehouseFilter, warehouseRecords) {
+  const slug = SECTION_SLUGS[section] || SECTION_SLUGS.Activities;
+  if (section !== "Inventory" || warehouseFilter === ALL_WAREHOUSES) return `#/${slug}`;
+  const warehouseRecord = warehouseRecordForFilter(warehouseFilter, warehouseRecords);
+  return `#/${slug}/${encodeURIComponent(warehouseRecord?.code || warehouseFilter)}`;
+}
+
 // QuickBooks sub-items look like "Parent:Child - CF"; the parent is the product and the
 // trailing uppercase code (CF, CT, IN...) is the warehouse it sits in.
 function qbParentName(item) {
@@ -450,8 +481,8 @@ export default function InventoryManagementSystem() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [profiles, setProfiles] = useState([]);
-  const [section, setSection] = useState("Activities");
-  const [warehouse, setWarehouse] = useState(ALL_WAREHOUSES);
+  const [section, setSection] = useState(() => routeFromHash(window.location.hash).section);
+  const [warehouse, setWarehouse] = useState(() => routeFromHash(window.location.hash).warehouse);
   const [activityWarehouse, setActivityWarehouse] = useState(ALL_WAREHOUSES);
   const [chargesWarehouse, setChargesWarehouse] = useState(ALL_WAREHOUSES);
   const [warehouses, setWarehouses] = useState([DEFAULT_WAREHOUSE]);
@@ -527,6 +558,32 @@ export default function InventoryManagementSystem() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
+  // Keep the URL in step with the page, including corrections such as a warehouse user's assigned warehouse.
+  useEffect(() => {
+    const hash = hashForRoute(section, warehouse, warehouses);
+    if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
+  }, [section, warehouse, warehouses]);
+
+  // Back/forward buttons and hand-edited URLs.
+  useEffect(() => {
+    function applyRoute() {
+      const route = routeFromHash(window.location.hash);
+      if (profile && !isOwner && OWNER_SECTIONS.includes(route.section)) return;
+      setSection(route.section);
+      if (route.section === "Inventory" && (!profile || isOwner)) setWarehouse(route.warehouse);
+    }
+
+    window.addEventListener("popstate", applyRoute);
+    return () => window.removeEventListener("popstate", applyRoute);
+  }, [profile, isOwner]);
+
+  function navigateTo(nextSection, nextWarehouse = warehouse) {
+    setSection(nextSection);
+    setWarehouse(nextWarehouse);
+    const hash = hashForRoute(nextSection, nextWarehouse, warehouses);
+    if (window.location.hash !== hash) window.history.pushState(null, "", hash);
+  }
+
   async function loadProfile(user) {
     setErrorMessage("");
     setSuccessMessage("");
@@ -557,7 +614,7 @@ export default function InventoryManagementSystem() {
       setWarehouse(assignedWarehouseFilter);
       setActivityWarehouse(assignedWarehouseFilter);
       setChargesWarehouse(assignedWarehouseFilter);
-      if (["Settings", "Warehouses", "Products", "Customers", "Suppliers"].includes(section)) setSection("Activities");
+      if (OWNER_SECTIONS.includes(section)) setSection("Activities");
     }
 
     setProfile(nextProfile);
@@ -1487,22 +1544,22 @@ export default function InventoryManagementSystem() {
             <div className="mt-3 text-xs text-slate-500">{profile.email}</div>
           </div>
 
-          <NavButton icon={<Activity size={18} />} active={section === "Activities"} onClick={() => setSection("Activities")}>Activities</NavButton>
+          <NavButton icon={<Activity size={18} />} active={section === "Activities"} onClick={() => navigateTo("Activities")}>Activities</NavButton>
 
           <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Inventory</div>
-          {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => { setSection("Inventory"); setWarehouse(ALL_WAREHOUSES); }}>All warehouses</NavButton>}
-          {selectableWarehouses.map((warehouseRecord) => <NavButton key={warehouseRecord.id || warehouseRecord.code} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === warehouseRecord.id} onClick={() => { setSection("Inventory"); setWarehouse(warehouseRecord.id); }}>{warehouseRecord.name}</NavButton>)}
+          {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => navigateTo("Inventory", ALL_WAREHOUSES)}>All warehouses</NavButton>}
+          {selectableWarehouses.map((warehouseRecord) => <NavButton key={warehouseRecord.id || warehouseRecord.code} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouseRecordForFilter(warehouse, warehouses)?.id === warehouseRecord.id} onClick={() => navigateTo("Inventory", warehouseRecord.id)}>{warehouseRecord.name}</NavButton>)}
 
           <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Charges</div>
-          <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => setSection("Charges")}>Charges</NavButton>
+          <NavButton icon={<DollarSign size={18} />} active={section === "Charges"} onClick={() => navigateTo("Charges")}>Charges</NavButton>
 
           {isOwner && <>
             <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Settings</div>
-            <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => setSection("Settings")}>Users</NavButton>
-            <NavButton icon={<Warehouse size={18} />} active={section === "Warehouses"} onClick={() => setSection("Warehouses")}>Warehouses</NavButton>
-            <NavButton icon={<Settings size={18} />} active={section === "Products"} onClick={() => setSection("Products")}>Products</NavButton>
-            <NavButton icon={<Settings size={18} />} active={section === "Customers"} onClick={() => setSection("Customers")}>Customers</NavButton>
-            <NavButton icon={<Settings size={18} />} active={section === "Suppliers"} onClick={() => setSection("Suppliers")}>Suppliers</NavButton>
+            <NavButton icon={<Settings size={18} />} active={section === "Settings"} onClick={() => navigateTo("Settings")}>Users</NavButton>
+            <NavButton icon={<Warehouse size={18} />} active={section === "Warehouses"} onClick={() => navigateTo("Warehouses")}>Warehouses</NavButton>
+            <NavButton icon={<Settings size={18} />} active={section === "Products"} onClick={() => navigateTo("Products")}>Products</NavButton>
+            <NavButton icon={<Settings size={18} />} active={section === "Customers"} onClick={() => navigateTo("Customers")}>Customers</NavButton>
+            <NavButton icon={<Settings size={18} />} active={section === "Suppliers"} onClick={() => navigateTo("Suppliers")}>Suppliers</NavButton>
           </>}
 
           <div className="mt-8 pt-4 border-t border-slate-200">
