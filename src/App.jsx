@@ -43,7 +43,7 @@ function money(n) {
 }
 
 function toMonthKey(dateValue) {
-  return (dateValue || "").slice(0, 7);
+  return normalizeDateKey(dateValue).slice(0, 7);
 }
 
 function monthLabelFromKey(monthKey) {
@@ -63,8 +63,27 @@ function shortDate(dateValue) {
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function formatDateDisplay(dateValue) {
+  const key = normalizeDateKey(dateValue);
+  if (!key) return "";
+  const [year, month, day] = key.split("-");
+  return `${month}-${day}-${year}`;
+}
+
 function dateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function normalizeDateKey(dateValue) {
+  if (!dateValue) return "";
+  if (dateValue instanceof Date) return dateKey(dateValue);
+
+  const stringValue = String(dateValue).trim();
+  const dateMatch = stringValue.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (dateMatch) return `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+
+  const parsedDate = new Date(stringValue);
+  return Number.isNaN(parsedDate.getTime()) ? "" : dateKey(parsedDate);
 }
 
 function addDays(date, days) {
@@ -165,7 +184,7 @@ function canonicalWarehouseKey(row, warehouseRecords = []) {
 function addActivityToQuantities(quantities, activity, today) {
   const pieces = Number(activity.pieces) || 0;
 
-  if (activity.activity_date < today) {
+  if (normalizeDateKey(activity.activity_date) <= today) {
     quantities.pallets += signedActivityUnits(activity);
     quantities.in_qty += pieces;
   } else if (pieces < 0) {
@@ -191,7 +210,8 @@ function deriveInventoryRowsFromActivities({ activities, warehouseFilter, wareho
   const grouped = new Map();
 
   activities.forEach((activity) => {
-    if (!activity.product || !activity.activity_date || !rowMatchesWarehouse(activity, warehouseFilter, warehouseRecords)) {
+    const activityDate = normalizeDateKey(activity.activity_date);
+    if (!activity.product || !activityDate || !rowMatchesWarehouse(activity, warehouseFilter, warehouseRecords)) {
       return;
     }
 
@@ -240,7 +260,7 @@ function buildWeeklyStorageRows(monthKey, activities, storageRate) {
     const startDate = dateKey(weekStart);
     const endDate = dateKey(addDays(weekStart, 6));
     const units = activities
-      .filter((activity) => activity.activity_date < startDate)
+      .filter((activity) => normalizeDateKey(activity.activity_date) < startDate)
       .reduce((sum, activity) => sum + signedActivityUnits(activity), 0);
     const unitsOnHand = Math.max(0, units);
 
@@ -303,7 +323,7 @@ function filterRowsByWarehouse(rows, warehouseFilter, warehouseRecords = []) {
 function normalizeActivity(activity) {
   return {
     ...activity,
-    activity_date: activity.activity_date || activity.date || "",
+    activity_date: normalizeDateKey(activity.activity_date || activity.date),
     documents: Array.isArray(activity.documents) ? activity.documents : [],
     warehouse_id: activity.warehouse_id || "",
     warehouse_name: activity.warehouses?.name || activity.warehouse || "",
@@ -574,7 +594,7 @@ export default function InventoryManagementSystem() {
     if (!session?.user) return;
     loadProfile(session.user);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
+  }, [session?.user?.id]);
 
   useEffect(() => {
     if (!profile) return;
@@ -586,7 +606,7 @@ export default function InventoryManagementSystem() {
       loadProfiles();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile]);
+  }, [profile?.id]);
 
   // Keep the URL in step with the page, including corrections such as a warehouse user's assigned warehouse.
   useEffect(() => {
@@ -1748,13 +1768,13 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
           <tbody>
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} displayValue={formatDateDisplay(activity.activity_date)} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "customer", value)} {...editProps(activity.id, "customer")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} {...editProps(activity.id, "lot_number")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.expiration_date} onSave={(value) => updateActivity(activity.id, "expiration_date", value)} {...editProps(activity.id, "expiration_date")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.expiration_date} displayValue={formatDateDisplay(activity.expiration_date)} onSave={(value) => updateActivity(activity.id, "expiration_date", value)} {...editProps(activity.id, "expiration_date")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "supplier", value)} {...editProps(activity.id, "supplier")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} {...editProps(activity.id, "repack")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} {...editProps(activity.id, "note")} /></td>
@@ -1955,7 +1975,7 @@ function InventoryView({ warehouse, rows, sort, setSort, unit, setUnit, canUploa
                 )}
                 {expanded && row.lots.map((lot) => (
                   <tr key={`${lot.lot_number}::${lot.expiration_date}`} className="bg-slate-50">
-                    <td className="py-2 pl-10 pr-4"><div className="grid grid-cols-2 gap-4"><span>{lot.lot_number || "—"}</span><span>{lot.expiration_date || "—"}</span></div></td>
+                    <td className="py-2 pl-10 pr-4"><div className="grid grid-cols-2 gap-4"><span>{lot.lot_number || "—"}</span><span>{formatDateDisplay(lot.expiration_date) || "—"}</span></div></td>
                     <td className="px-4 py-2">{lot.pallets}</td>
                     <QtyCell value={lot.in_qty} packSize={row.pack_size} className="px-4 py-2" />
                     <QtyCell value={lot.reserved_qty} packSize={row.pack_size} className="px-4 py-2" />
