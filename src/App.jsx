@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from "react";
+import { Fragment, useMemo, useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import {
   Search,
@@ -13,6 +13,8 @@ import {
   Activity,
   DollarSign,
   Save,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import readXlsxFile from "read-excel-file/browser";
 import { supabase } from "./supabaseClient";
@@ -160,6 +162,29 @@ function canonicalWarehouseKey(row, warehouseRecords = []) {
   return matchedWarehouse?.id || row?.warehouse_id || row?.warehouse || row?.warehouse_name || row?.warehouse_code || "";
 }
 
+function addActivityToQuantities(quantities, activity, today) {
+  const pieces = Number(activity.pieces) || 0;
+
+  if (activity.activity_date < today) {
+    quantities.pallets += signedActivityUnits(activity);
+    quantities.in_qty += pieces;
+  } else if (pieces < 0) {
+    quantities.reserved_qty += Math.abs(pieces);
+  } else if (pieces > 0) {
+    quantities.incoming_qty += pieces;
+  }
+}
+
+// Earliest expiration first so the next lot to ship is on top; lots used up entirely are left out.
+function visibleLots(lots) {
+  return Array.from(lots.values())
+    .filter((lot) => lot.pallets !== 0 || lot.in_qty !== 0 || lot.reserved_qty !== 0 || lot.incoming_qty !== 0)
+    .sort((a, b) =>
+      (a.expiration_date || "9999").localeCompare(b.expiration_date || "9999") ||
+      a.lot_number.localeCompare(b.lot_number, undefined, { numeric: true }),
+    );
+}
+
 function deriveInventoryRowsFromActivities({ activities, warehouseFilter, warehouseRecords = [] }) {
   const today = new Date().toISOString().slice(0, 10);
   const groupMode = warehouseFilter === ALL_WAREHOUSES ? "all" : "warehouse";
@@ -182,22 +207,27 @@ function deriveInventoryRowsFromActivities({ activities, warehouseFilter, wareho
       in_qty: 0,
       reserved_qty: 0,
       incoming_qty: 0,
+      lots: new Map(),
     };
-    const pieces = Number(activity.pieces) || 0;
+    const lotNumber = (activity.lot_number || "").trim();
+    const expirationDate = activity.expiration_date || "";
+    const lotKey = `${normalizeLookup(lotNumber)}::${expirationDate}`;
+    const lot = current.lots.get(lotKey) || {
+      lot_number: lotNumber,
+      expiration_date: expirationDate,
+      pallets: 0,
+      in_qty: 0,
+      reserved_qty: 0,
+      incoming_qty: 0,
+    };
 
-    if (activity.activity_date < today) {
-      current.pallets += signedActivityUnits(activity);
-      current.in_qty += pieces;
-    } else if (pieces < 0) {
-      current.reserved_qty += Math.abs(pieces);
-    } else if (pieces > 0) {
-      current.incoming_qty += pieces;
-    }
-
+    addActivityToQuantities(current, activity, today);
+    addActivityToQuantities(lot, activity, today);
+    current.lots.set(lotKey, lot);
     grouped.set(groupKey, current);
   });
 
-  return Array.from(grouped.values());
+  return Array.from(grouped.values()).map((row) => ({ ...row, lots: visibleLots(row.lots) }));
 }
 
 function buildWeeklyStorageRows(monthKey, activities, storageRate) {
@@ -825,7 +855,7 @@ export default function InventoryManagementSystem() {
     const inventoryItems = new Set(rows.map((row) => normalizeLookup(row.item)));
     qbQuantities.forEach((qbItem, key) => {
       if (qbItem.qty_lb === 0 || inventoryItems.has(key) || QB_NON_PRODUCT_PATTERN.test(qbItem.name)) return;
-      rows.push({ item: qbItem.name, warehouse: selectedWarehouse?.name || ALL_WAREHOUSES, pallets: 0, in_qty: 0, reserved_qty: 0, incoming_qty: 0 });
+      rows.push({ item: qbItem.name, warehouse: selectedWarehouse?.name || ALL_WAREHOUSES, pallets: 0, in_qty: 0, reserved_qty: 0, incoming_qty: 0, lots: [] });
     });
 
     return rows.map((row) => {
@@ -840,6 +870,12 @@ export default function InventoryManagementSystem() {
         in_qty: toUnit(row.in_qty),
         reserved_qty: toUnit(row.reserved_qty),
         incoming_qty: toUnit(row.incoming_qty),
+        lots: row.lots.map((lot) => ({
+          ...lot,
+          in_qty: toUnit(lot.in_qty),
+          reserved_qty: toUnit(lot.reserved_qty),
+          incoming_qty: toUnit(lot.incoming_qty),
+        })),
         qb_qty: qbLb === null ? null : inventoryUnit === "lb" ? qbLb : packSize ? qbLb / packSize : null,
         qb_mismatch: qbLb !== null && packSize ? Math.abs(row.in_qty * packSize - qbLb) >= 0.5 : null,
       };
@@ -918,7 +954,7 @@ export default function InventoryManagementSystem() {
     const selectedWarehouse = field === "warehouse_id" ? warehouses.find((warehouseRecord) => warehouseRecord.id === value) : null;
     const payload = field === "warehouse_id"
       ? { warehouse_id: selectedWarehouse?.id || null, warehouse: selectedWarehouse?.name || "" }
-      : { [field]: numberFields.includes(field) ? Number(value || 0) : value };
+      : { [field]: numberFields.includes(field) ? Number(value || 0) : field === "expiration_date" ? value || null : value };
 
     setErrorMessage("");
     setSuccessMessage("");
@@ -946,7 +982,7 @@ export default function InventoryManagementSystem() {
     );
     setSuccessMessage("Activity saved.");
 
-    if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product"].includes(field)) setSuccessMessage("Activity saved. Inventory refreshed.");
+    if (["activity_date", "warehouse", "warehouse_id", "pallets", "pieces", "product", "lot_number", "expiration_date"].includes(field)) setSuccessMessage("Activity saved. Inventory refreshed.");
   }
 
   async function deleteActivity(id) {
@@ -1078,6 +1114,7 @@ export default function InventoryManagementSystem() {
         const pallets = parseOptionalNumber(data.pallets || "");
         const pieces = parseOptionalNumber(data.pieces || "");
         const repack = parseRepack(data.repack || "");
+        const expirationDate = data.expiration_date || null;
         const warehouseCode = data.warehouse_code?.trim() || "";
         const selectedWarehouse =
           warehouseCode
@@ -1089,6 +1126,7 @@ export default function InventoryManagementSystem() {
         if (pallets === null) errors.push(`Row ${rowNumber}: pallets must be a number.`);
         if (pieces === null) errors.push(`Row ${rowNumber}: pieces must be a number.`);
         if (repack === null) errors.push(`Row ${rowNumber}: repack must be Y/N, Yes/No, true/false, or blank.`);
+        if (expirationDate && Number.isNaN(Date.parse(expirationDate))) errors.push(`Row ${rowNumber}: expiration_date must be a date.`);
         const assignedWarehouseFilter = profile.warehouse_id || profile.warehouse_name || profile.warehouse;
         const canImportWarehouse =
           profile.role !== "warehouse" ||
@@ -1115,6 +1153,7 @@ export default function InventoryManagementSystem() {
           product,
           customer,
           lot_number: data.lot_number || "",
+          expiration_date: expirationDate,
           supplier,
           repack,
           note: data.note || "",
@@ -1640,13 +1679,14 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
     ["product", "Product"],
     ["customer", "Customer"],
     ["lot_number", "Lot Number"],
+    ["expiration_date", "Expiration Date"],
     ["supplier", "Supplier"],
     ["repack", "Repack"],
     ["note", "Note"],
     ["docs", "Docs"],
     ["delete", "Delete"],
   ];
-  const sortable = new Set(["activity_date", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "repack"]);
+  const sortable = new Set(["activity_date", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "expiration_date", "repack"]);
   const warehouseOptions = isOwner
     ? [{ id: ALL_WAREHOUSES, code: "", name: "All Warehouses" }, ...warehouses]
     : warehouses;
@@ -1714,6 +1754,7 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "customer", value)} {...editProps(activity.id, "customer")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} {...editProps(activity.id, "lot_number")} /></td>
+                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.expiration_date} onSave={(value) => updateActivity(activity.id, "expiration_date", value)} {...editProps(activity.id, "expiration_date")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "supplier", value)} {...editProps(activity.id, "supplier")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} {...editProps(activity.id, "repack")} /></td>
                 <td className="px-4 py-3 align-top"><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} {...editProps(activity.id, "note")} /></td>
@@ -1820,12 +1861,22 @@ function InventoryView({ warehouse, rows, sort, setSort, unit, setUnit, canUploa
     ["incoming_qty", "Incoming"],
     ...(showQb ? [["qb_qty", `QuickBooks (${unit})`]] : []),
   ];
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
 
   function toggleSort(key) {
     setSort((current) => ({
       key,
       direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
     }));
+  }
+
+  function toggleRow(rowKey) {
+    setExpandedRows((current) => {
+      const next = new Set(current);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
+      return next;
+    });
   }
 
   return <>
@@ -1866,31 +1917,63 @@ function InventoryView({ warehouse, rows, sort, setSort, unit, setUnit, canUploa
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, index) => (
-            <tr key={`${row.item}-${row.warehouse_id || row.warehouse || index}`} className="border-t hover:bg-slate-50">
-              <td className="px-4 py-3 align-top">{row.item}</td>
-              <td className="px-4 py-3 align-top">{Number(row.pallets) || 0}</td>
-              <QtyCell value={row.in_qty} packSize={row.pack_size} />
-              <QtyCell value={row.reserved_qty} packSize={row.pack_size} />
-              <QtyCell value={row.incoming_qty} packSize={row.pack_size} />
-              {showQb && (
-                <td
-                  className={`px-4 py-3 align-top ${row.qb_mismatch ? "bg-amber-50 font-semibold text-amber-800" : row.qb_mismatch === false ? "text-emerald-700" : ""}`}
-                  title={row.qb_qty === null ? "Not in QuickBooks, or no pack size to convert lb to pc" : row.qb_mismatch ? "Differs from on-hand quantity" : undefined}
-                >
-                  {formatQty(row.qb_qty)}
-                </td>
-              )}
-            </tr>
-          ))}
+          {rows.map((row, index) => {
+            const rowKey = `${row.item}-${row.warehouse_id || row.warehouse || index}`;
+            const expanded = expandedRows.has(rowKey);
+            return (
+              <Fragment key={rowKey}>
+                <tr className="border-t hover:bg-slate-50">
+                  <td className="px-4 py-3 align-top">
+                    <button className="flex items-start gap-1 text-left hover:text-slate-600" aria-expanded={expanded} title="Show lot numbers and expiration dates" onClick={() => toggleRow(rowKey)}>
+                      {expanded ? <ChevronDown size={16} className="mt-0.5 shrink-0" /> : <ChevronRight size={16} className="mt-0.5 shrink-0" />}
+                      {row.item}
+                    </button>
+                  </td>
+                  <td className="px-4 py-3 align-top">{Number(row.pallets) || 0}</td>
+                  <QtyCell value={row.in_qty} packSize={row.pack_size} />
+                  <QtyCell value={row.reserved_qty} packSize={row.pack_size} />
+                  <QtyCell value={row.incoming_qty} packSize={row.pack_size} />
+                  {showQb && (
+                    <td
+                      className={`px-4 py-3 align-top ${row.qb_mismatch ? "bg-amber-50 font-semibold text-amber-800" : row.qb_mismatch === false ? "text-emerald-700" : ""}`}
+                      title={row.qb_qty === null ? "Not in QuickBooks, or no pack size to convert lb to pc" : row.qb_mismatch ? "Differs from on-hand quantity" : undefined}
+                    >
+                      {formatQty(row.qb_qty)}
+                    </td>
+                  )}
+                </tr>
+                {expanded && row.lots.length === 0 && (
+                  <tr className="bg-slate-50 text-slate-500">
+                    <td colSpan={columns.length} className="py-2 pl-10 pr-4">No lot inventory on record.</td>
+                  </tr>
+                )}
+                {expanded && row.lots.length > 0 && (
+                  <tr className="bg-slate-50 text-xs font-semibold text-slate-500">
+                    <td className="py-2 pl-10 pr-4"><div className="grid grid-cols-2 gap-4"><span>Lot Number</span><span>Expiration Date</span></div></td>
+                    <td colSpan={columns.length - 1} />
+                  </tr>
+                )}
+                {expanded && row.lots.map((lot) => (
+                  <tr key={`${lot.lot_number}::${lot.expiration_date}`} className="bg-slate-50">
+                    <td className="py-2 pl-10 pr-4"><div className="grid grid-cols-2 gap-4"><span>{lot.lot_number || "—"}</span><span>{lot.expiration_date || "—"}</span></div></td>
+                    <td className="px-4 py-2">{lot.pallets}</td>
+                    <QtyCell value={lot.in_qty} packSize={row.pack_size} className="px-4 py-2" />
+                    <QtyCell value={lot.reserved_qty} packSize={row.pack_size} className="px-4 py-2" />
+                    <QtyCell value={lot.incoming_qty} packSize={row.pack_size} className="px-4 py-2" />
+                    {showQb && <td className="px-4 py-2" />}
+                  </tr>
+                ))}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>
   </>;
 }
 
-function QtyCell({ value, packSize }) {
-  return <td className="px-4 py-3 align-top" title={value === null && !packSize ? "Set a pack size on the Products page to show lb" : undefined}>{formatQty(value)}</td>;
+function QtyCell({ value, packSize, className = "px-4 py-3 align-top" }) {
+  return <td className={className} title={value === null && !packSize ? "Set a pack size on the Products page to show lb" : undefined}>{formatQty(value)}</td>;
 }
 
 function NewQbProductsPanel({ names, onAdd }) {
