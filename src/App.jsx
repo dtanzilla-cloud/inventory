@@ -15,6 +15,7 @@ import {
   Save,
   ChevronDown,
   ChevronRight,
+  Loader2,
 } from "lucide-react";
 import readXlsxFile from "read-excel-file/browser";
 import { supabase } from "./supabaseClient";
@@ -24,9 +25,10 @@ const DEFAULT_WAREHOUSE = { id: null, code: "WH-A", name: "Warehouse A", active:
 const DOCUMENT_BUCKET = "activity-documents";
 const CHARGE_INVOICE_BUCKET = "charge-invoices";
 const DEFAULT_CHARGE_MONTH = "December 2025";
-const OWNER_SECTIONS = ["Settings", "Warehouses", "Products", "Customers", "Suppliers"];
+const OWNER_SECTIONS = ["Packing Lists", "Settings", "Warehouses", "Products", "Customers", "Suppliers"];
 const SECTION_SLUGS = {
   Activities: "activities",
+  "Packing Lists": "packing-lists",
   Inventory: "inventory",
   Charges: "charges",
   Settings: "users",
@@ -550,6 +552,9 @@ export default function InventoryManagementSystem() {
   const [chargesLoading, setChargesLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [uploadingActivityId, setUploadingActivityId] = useState(null);
+  const [deletingActivityId, setDeletingActivityId] = useState(null);
+  const [packingLists, setPackingLists] = useState([]);
+  const [packingListBusyId, setPackingListBusyId] = useState(null);
   const [importingActivities, setImportingActivities] = useState(false);
   const [uploadingInvoice, setUploadingInvoice] = useState(false);
   const [activitySort, setActivitySort] = useState({ key: "activity_date", direction: "desc" });
@@ -604,9 +609,15 @@ export default function InventoryManagementSystem() {
     loadCharges();
     if (isOwner) {
       loadProfiles();
+      loadPackingLists();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.id]);
+
+  // The scan adds entries in the background, so opening the page picks up new ones.
+  useEffect(() => {
+    if (isOwner && section === "Packing Lists") loadPackingLists();
+  }, [section, isOwner]);
 
   // Keep the URL in step with the page, including corrections such as a warehouse user's assigned warehouse.
   useEffect(() => {
@@ -1006,17 +1017,86 @@ export default function InventoryManagementSystem() {
   }
 
   async function deleteActivity(id) {
-    if (!id) return;
+    if (!id || deletingActivityId) return;
 
-    const { error } = await supabase.from("activities").delete().eq("id", id);
+    setDeletingActivityId(id);
 
+    try {
+      const { error } = await supabase.from("activities").delete().eq("id", id);
+
+      if (error) {
+        console.error(error);
+        setErrorMessage(`Delete failed in Supabase: ${error.message}`);
+        return;
+      }
+
+      setActivities((current) => current.filter((activity) => activity.id !== id));
+    } finally {
+      setDeletingActivityId(null);
+    }
+  }
+
+  async function loadPackingLists() {
+    const { data, error } = await supabase
+      .from("packing_list_queue")
+      .select("id, file_name, file_path, web_view_link, reasons, draft, created_at")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true });
+
+    // Logged only: the page should still work before the scan has been set up.
     if (error) {
       console.error(error);
-      setErrorMessage(`Delete failed in Supabase: ${error.message}`);
       return;
     }
+    setPackingLists(data || []);
+  }
 
-    setActivities((current) => current.filter((activity) => activity.id !== id));
+  async function approvePackingList(entry, rows) {
+    if (packingListBusyId) return;
+    setPackingListBusyId(entry.id);
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    try {
+      const { data, error } = await supabase.rpc("approve_packing_list", { entry_id: entry.id, draft_rows: rows });
+
+      if (error) {
+        console.error(error);
+        setErrorMessage(`Could not add ${entry.file_name}: ${error.message}`);
+        await loadPackingLists();
+        return;
+      }
+
+      setActivities((current) => [...data.map(normalizeActivity), ...current]);
+      setPackingLists((current) => current.filter((item) => item.id !== entry.id));
+      setSuccessMessage(`Added ${data.length} activit${data.length === 1 ? "y" : "ies"} from ${entry.file_name}.`);
+    } finally {
+      setPackingListBusyId(null);
+    }
+  }
+
+  async function dismissPackingList(entry) {
+    if (packingListBusyId) return;
+    setPackingListBusyId(entry.id);
+    setErrorMessage("");
+    setSuccessMessage("");
+
+    try {
+      const { error } = await supabase
+        .from("packing_list_queue")
+        .update({ status: "dismissed", reviewed_by: profile.id, reviewed_at: new Date().toISOString() })
+        .eq("id", entry.id);
+
+      if (error) {
+        console.error(error);
+        setErrorMessage(`Could not dismiss ${entry.file_name}: ${error.message}`);
+        return;
+      }
+
+      setPackingLists((current) => current.filter((item) => item.id !== entry.id));
+    } finally {
+      setPackingListBusyId(null);
+    }
   }
 
   async function uploadQbInventory(fileList) {
@@ -1604,6 +1684,7 @@ export default function InventoryManagementSystem() {
           </div>
 
           <NavButton icon={<Activity size={18} />} active={section === "Activities"} onClick={() => navigateTo("Activities")}>Activities</NavButton>
+          {isOwner && <NavButton icon={<FileText size={18} />} active={section === "Packing Lists"} onClick={() => navigateTo("Packing Lists")}>Packing Lists{packingLists.length > 0 && ` (${packingLists.length})`}</NavButton>}
 
           <div className="mt-4 mb-2 text-xs font-semibold text-slate-400 uppercase">Inventory</div>
           {isOwner && <NavButton key={ALL_WAREHOUSES} icon={<Warehouse size={18} />} active={section === "Inventory" && warehouse === ALL_WAREHOUSES} onClick={() => navigateTo("Inventory", ALL_WAREHOUSES)}>All warehouses</NavButton>}
@@ -1626,11 +1707,12 @@ export default function InventoryManagementSystem() {
           </div>
         </aside>
 
-        <main className="flex-1 p-8">
+        <main className="min-w-0 flex-1 p-8">
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
             {errorMessage && <div className="mb-4 whitespace-pre-line rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>}
             {successMessage && <div className="mb-4 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{successMessage}</div>}
-            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
+            {section === "Activities" && <ActivitiesView {...{ activities: sortedActivities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, deletingActivityId, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses: selectableWarehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }} />}
+            {section === "Packing Lists" && isOwner && <PackingListsView entries={packingLists} products={products} customers={customers} warehouses={activeWarehouses} busyId={packingListBusyId} onApprove={approvePackingList} onDismiss={dismissPackingList} />}
             {section === "Inventory" && <InventoryView warehouse={warehouse === ALL_WAREHOUSES ? ALL_WAREHOUSES : warehouseRecordForFilter(warehouse, warehouses)?.name || warehouse} rows={sortedInventory} sort={inventorySort} setSort={setInventorySort} unit={inventoryUnit} setUnit={setInventoryUnit} canUploadQb={isOwner && warehouse === ALL_WAREHOUSES} showQb={showQb} qbSnapshot={qbSnapshot} uploadingQb={uploadingQb} onUploadQb={uploadQbInventory} onClearQb={clearQbSnapshot} newQbProducts={newQbProducts} onAddQbProducts={addQbProducts} />}
             {section === "Charges" && <ChargesView month={selectedChargeMonth} months={visibleChargeMonths} setMonth={setMonth} charges={charges} loading={chargesLoading} uploadingInvoice={uploadingInvoice} onSaveRates={saveBillingRates} onUploadInvoices={uploadChargeInvoices} warehouses={selectableWarehouses} isOwner={isOwner} chargesWarehouse={chargesWarehouse} setChargesWarehouse={setChargesWarehouse} />}
             {section === "Settings" && isOwner && <SettingsView profiles={profiles} warehouses={activeWarehouses} onSave={saveProfile} onDeactivate={deactivateProfile} />}
@@ -1691,22 +1773,24 @@ function KPI({ label, value }) {
   return <Card className="rounded-2xl shadow-sm"><CardContent className="p-5"><div className="text-sm text-slate-500">{label}</div><div className="text-2xl font-bold mt-1">{value}</div></CardContent></Card>;
 }
 
-function ActivitiesView({ activities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }) {
+function ActivitiesView({ activities, query, setQuery, addEvent, importActivitiesCsv, importingActivities, updateActivity, deleteActivity, deletingActivityId, uploadDocuments, uploadingActivityId, loading, activitySort, setActivitySort, products, customers, suppliers, warehouses, isOwner, activityWarehouse, setActivityWarehouse, editingCell, setEditingCell }) {
   const columns = [
-    ["activity_date", "Date"],
-    ["pallets", "Pallet"],
-    ["pieces", "Pieces"],
-    ["product", "Product"],
-    ["customer", "Customer"],
-    ["lot_number", "Lot Number"],
-    ["expiration_date", "Expiration Date"],
-    ["supplier", "Supplier"],
-    ["repack", "Repack"],
-    ["note", "Note"],
-    ["docs", "Docs"],
-    ["delete", "Delete"],
+    ["activity_date", "Date", "9%"],
+    ["warehouse_name", "Warehouse", "8.5%"],
+    ["pallets", "Pallet", "5%"],
+    ["pieces", "Pieces", "6%"],
+    ["product", "Product", "9.5%"],
+    ["customer", "Customer", "9%"],
+    ["lot_number", "Lot Number", "9%"],
+    ["expiration_date", "Expiration Date", "8%"],
+    ["supplier", "Supplier", "8%"],
+    ["repack", "Repack", "6%"],
+    ["note", "Note", "8%"],
+    ["docs", "Docs", "8%"],
+    ["delete", "Delete", "6%"],
   ];
-  const sortable = new Set(["activity_date", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "expiration_date", "repack"]);
+  const cellClass = "px-2 py-3 align-top [overflow-wrap:anywhere]";
+  const sortable = new Set(["activity_date", "warehouse_name", "pallets", "pieces", "product", "customer", "supplier", "lot_number", "expiration_date", "repack"]);
   const warehouseOptions = isOwner
     ? [{ id: ALL_WAREHOUSES, code: "", name: "All Warehouses" }, ...warehouses]
     : warehouses;
@@ -1717,6 +1801,14 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
       key,
       direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
     }));
+  }
+
+  function warehouseCellOptions(activity) {
+    const options = warehouses.map((warehouseRecord) => ({ value: warehouseRecord.id, label: warehouseRecord.name }));
+    // Rows can still point at a deactivated warehouse, which is not in the selectable list.
+    return activity.warehouse_id && !options.some((option) => option.value === activity.warehouse_id)
+      ? [{ value: activity.warehouse_id, label: activity.warehouse_name }, ...options]
+      : options;
   }
 
   function editProps(activityId, field) {
@@ -1753,12 +1845,12 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
       <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">Loading activities...</div>
     ) : (
       <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
-        <table className="w-full text-sm">
+        <table className="w-full table-fixed text-xs">
           <thead className="bg-slate-100 text-slate-600">
             <tr>
-              {columns.map(([key, label]) => (
-                <th key={key} className="text-left px-4 py-3 font-semibold">
-                  <button className={sortable.has(key) ? "font-semibold hover:text-slate-900" : "font-semibold"} onClick={() => toggleSort(key)}>
+              {columns.map(([key, label, width]) => (
+                <th key={key} style={{ width }} className="text-left px-2 py-3 font-semibold [overflow-wrap:anywhere]">
+                  <button className={sortable.has(key) ? "text-left font-semibold hover:text-slate-900" : "text-left font-semibold"} onClick={() => toggleSort(key)}>
                     {label}{activitySort.key === key ? activitySort.direction === "asc" ? " ↑" : " ↓" : ""}
                   </button>
                 </th>
@@ -1768,18 +1860,19 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
           <tbody>
             {activities.map((activity) => (
               <tr key={activity.id} className="border-t hover:bg-slate-50">
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.activity_date} displayValue={formatDateDisplay(activity.activity_date)} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "customer", value)} {...editProps(activity.id, "customer")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} {...editProps(activity.id, "lot_number")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="date" value={activity.expiration_date} displayValue={formatDateDisplay(activity.expiration_date)} onSave={(value) => updateActivity(activity.id, "expiration_date", value)} {...editProps(activity.id, "expiration_date")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "supplier", value)} {...editProps(activity.id, "supplier")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} {...editProps(activity.id, "repack")} /></td>
-                <td className="px-4 py-3 align-top"><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} {...editProps(activity.id, "note")} /></td>
-                <td className="px-4 py-3 align-top"><DocUpload documents={activity.documents} uploading={uploadingActivityId === activity.id} onChange={(files) => uploadDocuments(activity.id, files)} /></td>
-                <td className="px-4 py-3 align-top"><Button size="sm" variant="ghost" onClick={() => deleteActivity(activity.id)}><Trash2 size={16} /></Button></td>
+                <td className={cellClass}><EditableCell type="date" value={activity.activity_date} displayValue={formatDateDisplay(activity.activity_date)} onSave={(value) => updateActivity(activity.id, "activity_date", value)} {...editProps(activity.id, "activity_date")} /></td>
+                <td className={cellClass}><EditableCell type="select" value={activity.warehouse_id} displayValue={activity.warehouse_name} options={warehouseCellOptions(activity)} disabled={!isOwner} onSave={(value) => { if (value) return updateActivity(activity.id, "warehouse_id", value); }} {...editProps(activity.id, "warehouse_id")} /></td>
+                <td className={cellClass}><EditableCell type="number" value={activity.pallets} onSave={(value) => updateActivity(activity.id, "pallets", value)} {...editProps(activity.id, "pallets")} /></td>
+                <td className={cellClass}><EditableCell type="number" value={activity.pieces} onSave={(value) => updateActivity(activity.id, "pieces", value)} {...editProps(activity.id, "pieces")} /></td>
+                <td className={cellClass}><EditableCell type="select" value={activity.product} options={optionNames(products, activity.product)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "product", value)} {...editProps(activity.id, "product")} /></td>
+                <td className={cellClass}><EditableCell type="select" value={activity.customer} options={optionNames(customers, activity.customer)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "customer", value)} {...editProps(activity.id, "customer")} /></td>
+                <td className={cellClass}><EditableCell value={activity.lot_number} onSave={(value) => updateActivity(activity.id, "lot_number", value)} {...editProps(activity.id, "lot_number")} /></td>
+                <td className={cellClass}><EditableCell type="date" value={activity.expiration_date} displayValue={formatDateDisplay(activity.expiration_date)} onSave={(value) => updateActivity(activity.id, "expiration_date", value)} {...editProps(activity.id, "expiration_date")} /></td>
+                <td className={cellClass}><EditableCell type="select" value={activity.supplier} options={optionNames(suppliers, activity.supplier)} emptyOptionsFallback onSave={(value) => updateActivity(activity.id, "supplier", value)} {...editProps(activity.id, "supplier")} /></td>
+                <td className={cellClass}><EditableCell type="select" value={activity.repack} options={["", "Y", "N"]} onSave={(value) => updateActivity(activity.id, "repack", value)} {...editProps(activity.id, "repack")} /></td>
+                <td className={cellClass}><EditableCell value={activity.note} onSave={(value) => updateActivity(activity.id, "note", value)} {...editProps(activity.id, "note")} /></td>
+                <td className={cellClass}><DocUpload documents={activity.documents} uploading={uploadingActivityId === activity.id} onChange={(files) => uploadDocuments(activity.id, files)} /></td>
+                <td className={cellClass}><Button size="sm" variant="ghost" className="!px-0.5" aria-label={deletingActivityId === activity.id ? "Deleting" : "Delete"} disabled={Boolean(deletingActivityId)} onClick={() => deleteActivity(activity.id)}>{deletingActivityId === activity.id ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}</Button></td>
               </tr>
             ))}
           </tbody>
@@ -1787,6 +1880,110 @@ function ActivitiesView({ activities, query, setQuery, addEvent, importActivitie
       </div>
     )}
   </>;
+}
+
+function PackingListsView({ entries, products, customers, warehouses, busyId, onApprove, onDismiss }) {
+  return <>
+    <Header title="Packing Lists" subtitle="New PL PDFs from Google Drive. Check each one, then add it to Activities." />
+    {entries.length === 0
+      ? <div className="rounded-2xl border bg-white p-6 text-sm text-slate-500 shadow-sm">No packing lists are waiting for review.</div>
+      : <div className="space-y-4">
+        {entries.map((entry) => <PackingListCard key={entry.id} entry={entry} products={products} customers={customers} warehouses={warehouses} busyId={busyId} onApprove={onApprove} onDismiss={onDismiss} />)}
+      </div>}
+  </>;
+}
+
+function PackingListCard({ entry, products, customers, warehouses, busyId, onApprove, onDismiss }) {
+  const [rows, setRows] = useState(entry.draft?.rows || []);
+  const inputClass = "w-full rounded border bg-white px-2 py-1";
+  const busy = busyId === entry.id;
+  const complete = rows.length > 0 && rows.every((row) =>
+    row.activity_date && row.warehouse_id && row.product && row.customer && row.pallets !== "" && row.pieces !== "");
+
+  function changeRow(index, changes) {
+    setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, ...changes } : row));
+  }
+
+  function changeWarehouse(index, id) {
+    const warehouseRecord = warehouses.find((record) => record.id === id);
+    changeRow(index, { warehouse_id: id, warehouse: warehouseRecord?.name || "" });
+  }
+
+  function submitRows() {
+    return rows.map((row) => ({
+      activity_date: row.activity_date,
+      warehouse: row.warehouse,
+      warehouse_id: row.warehouse_id,
+      pallets: Number(row.pallets),
+      pieces: Number(row.pieces),
+      product: row.product,
+      customer: row.customer,
+      lot_number: row.lot_number,
+      expiration_date: row.expiration_date || null,
+      supplier: "",
+      repack: "",
+      note: row.note,
+    }));
+  }
+
+  return (
+    <div className="rounded-2xl border bg-white p-4 shadow-sm">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <a href={entry.web_view_link} target="_blank" rel="noreferrer" className="font-semibold underline-offset-2 hover:underline [overflow-wrap:anywhere]">{entry.file_name}</a>
+          <div className="text-xs text-slate-500 [overflow-wrap:anywhere]">{entry.file_path}</div>
+        </div>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" disabled={Boolean(busyId)} onClick={() => onDismiss(entry)}>Dismiss</Button>
+          <Button size="sm" disabled={Boolean(busyId) || !complete} onClick={() => onApprove(entry, submitRows())}>
+            {busy && <Loader2 size={14} className="mr-1 animate-spin" />}Add to Activities
+          </Button>
+        </div>
+      </div>
+
+      {entry.reasons.length > 0 && (
+        <ul className="mb-3 list-disc rounded-xl border border-amber-200 bg-amber-50 py-2 pl-7 pr-3 text-xs text-amber-900">
+          {entry.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+        </ul>
+      )}
+      {entry.draft?.slip_customer && <div className="mb-2 text-xs text-slate-500">Customer on the PDF: {entry.draft.slip_customer}</div>}
+
+      {rows.length === 0
+        ? <div className="text-sm text-slate-500">No rows could be read from this PDF. Open it to check, then add any rows with Add Event on the Activities page and dismiss this entry.</div>
+        : <div className="space-y-3">
+          {rows.map((row, index) => (
+            <div key={index} className="rounded-xl border p-3">
+              <div className="mb-2 text-xs text-slate-500 [overflow-wrap:anywhere]">On the PDF: {row.pdf_text}{row.pdf_packing && ` · ${row.pdf_packing}`}</div>
+              <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+                <label className="block">Date (Ship Date on the PDF)<input type="date" className={inputClass} value={row.activity_date || ""} onChange={(event) => changeRow(index, { activity_date: event.target.value })} /></label>
+                <label className="block">Warehouse
+                  <select className={inputClass} value={row.warehouse_id} onChange={(event) => changeWarehouse(index, event.target.value)}>
+                    <option value=""></option>
+                    {warehouses.map((warehouseRecord) => <option key={warehouseRecord.id} value={warehouseRecord.id}>{warehouseRecord.name}</option>)}
+                  </select>
+                </label>
+                <label className="block">Pallet{row.pallets_estimated && " (estimated)"}<input type="number" className={inputClass} value={row.pallets} onChange={(event) => changeRow(index, { pallets: event.target.value, pallets_estimated: false })} /></label>
+                <label className="block">Pieces<input type="number" className={inputClass} value={row.pieces} onChange={(event) => changeRow(index, { pieces: event.target.value })} /></label>
+                <label className="block">Product
+                  <select className={inputClass} value={row.product} onChange={(event) => changeRow(index, { product: event.target.value })}>
+                    <option value=""></option>
+                    {optionNames(products, row.product).map((name) => <option key={name} value={name}>{name}</option>)}
+                  </select>
+                </label>
+                <label className="block">Customer
+                  <select className={inputClass} value={row.customer} onChange={(event) => changeRow(index, { customer: event.target.value })}>
+                    <option value=""></option>
+                    {optionNames(customers, row.customer).map((name) => <option key={name} value={name}>{name}</option>)}
+                  </select>
+                </label>
+                <label className="block">Lot Number<input className={inputClass} value={row.lot_number} onChange={(event) => changeRow(index, { lot_number: event.target.value })} /></label>
+                <label className="block">Note<input className={inputClass} value={row.note} onChange={(event) => changeRow(index, { note: event.target.value })} /></label>
+              </div>
+            </div>
+          ))}
+        </div>}
+    </div>
+  );
 }
 
 function EditableCell({ value = "", displayValue, type = "text", options = [], disabled = false, emptyOptionsFallback = false, active = false, onActivate, onDeactivate, onSave }) {
@@ -1840,11 +2037,14 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
     return <button className="min-h-6 w-full text-left disabled:cursor-not-allowed" disabled={disabled} onClick={startEditing}>{displayValue || value || "-"}</button>;
   }
 
+  // Columns can be narrower than a usable field, so a field being edited may extend over the next cell.
+  const fieldClass = `relative z-10 w-full ${type === "date" ? "min-w-36" : "min-w-24"} rounded border bg-white px-2 py-1`;
+
   if (type === "select") {
     if (emptyOptionsFallback && options.length === 0) {
       return (
         <input
-          className="w-full rounded border px-2 py-1"
+          className={fieldClass}
           autoFocus
           placeholder="No options - type value"
           value={draft}
@@ -1856,7 +2056,7 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
     }
 
     return (
-      <select className="w-full rounded border px-2 py-1" autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown}>
+      <select className={fieldClass} autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown}>
         <option value=""></option>
         {options.map((option) => {
           const optionValue = typeof option === "object" ? option.value : option;
@@ -1868,7 +2068,7 @@ function EditableCell({ value = "", displayValue, type = "text", options = [], d
   }
 
   return (
-    <input className="w-full rounded border px-2 py-1" autoFocus type={type} value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown} />
+    <input className={fieldClass} autoFocus type={type} value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={save} onKeyDown={handleKeyDown} />
   );
 }
 
